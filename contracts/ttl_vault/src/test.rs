@@ -3300,3 +3300,84 @@ fn test_set_spending_limit_zero_is_invalid() {
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
     client.set_spending_limit(&vault_id, &Some(0_i128));
 }
+
+// ---- Task 2: merge_vaults tests ----
+
+#[test]
+fn test_merge_vaults_transfers_balance_and_cancels_sources() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let v1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let v2 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let target = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.deposit(&v1, &owner, &500_000i128);
+    client.deposit(&v2, &owner, &300_000i128);
+
+    let sources = vec![&env, v1, v2];
+    client.merge_vaults(&target, &sources, &owner);
+
+    let target_vault = client.get_vault(&target);
+    assert_eq!(target_vault.balance, 800_000i128);
+
+    let s1 = client.get_vault(&v1);
+    let s2 = client.get_vault(&v2);
+    assert_eq!(s1.status, ReleaseStatus::Cancelled);
+    assert_eq!(s2.status, ReleaseStatus::Cancelled);
+    assert_eq!(s1.balance, 0);
+    assert_eq!(s2.balance, 0);
+}
+
+#[test]
+fn test_merge_vaults_different_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let other = Address::generate(&env);
+    let other_beneficiary = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &client.get_contract_token()).mint(&other, &1_000_000);
+
+    let v2 = client.create_vault(&other, &other_beneficiary, &3600u64, &None);
+    let target = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let sources = vec![&env, v2];
+    let result = client.try_merge_vaults(&target, &sources, &owner);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_merge_vaults_not_owner_of_target_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let other = Address::generate(&env);
+
+    let v1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let target = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let sources = vec![&env, v1];
+    let result = client.try_merge_vaults(&target, &sources, &other);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_merge_vaults_source_equals_target_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let target = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let sources = vec![&env, target];
+    let result = client.try_merge_vaults(&target, &sources, &owner);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_merge_vaults_emits_activity_log() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let v1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let target = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let sources = vec![&env, v1];
+    client.merge_vaults(&target, &sources, &owner);
+
+    let log = client.get_vault_activity_log(&target);
+    let actions: Vec<String> = log.iter().map(|e| e.action).collect();
+    assert!(actions.iter().any(|a| *a == String::from_str(&env, "merge_vaults_target")));
+}
