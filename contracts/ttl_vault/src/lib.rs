@@ -12,6 +12,7 @@ use types::{
     ArchivedVaultInfo, OwnershipTransferRequest, AuditEntry, MultiSigConfig, MultiSigProposal,
     MultiSigOperation, ProposalStatus, PasskeyUsageEntry, BeneficiaryStatus, BridgeConfig,
     StateTransitionEntry, OwnershipProof, IntegrityReport, VaultStatusSummary,
+    TtlBorrowRecord,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -30,6 +31,8 @@ use types::{
     OWNERSHIP_CANCELLED_TOPIC,
     MetadataVersionEntry, META_VERSION_TOPIC, META_REVERT_TOPIC, VAULT_ARCHIVED_TOPIC,
     VAULT_CAP_TOPIC,
+    STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
+    TTL_BORROW_TOPIC, TTL_REPAY_TOPIC,
 };
 
 #[cfg(test)]
@@ -134,6 +137,8 @@ pub enum ContractError {
     VaultCapacityExceeded = 49,
     IncompatibleVaultToken = 50,
     IncompatibleVaultStatus = 51,
+    TtlBorrowNotFound = 52,
+    TtlBorrowAlreadyRepaid = 53,
 }
 
 #[contract]
@@ -3033,6 +3038,161 @@ impl TtlVaultContract {
         let key = DataKey::Vault(vault_id);
         let ttl = vault_ttl_ledgers(check_in_interval);
         env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+    }
+
+    /// Stub: records check-in timestamp for adaptive interval logic.
+    fn record_check_in_history(_env: &Env, _vault_id: u64, _timestamp: u64) {}
+
+    /// Stub: updates check-in streak counter.
+    fn update_check_in_streak(_env: &Env, _vault_id: u64, _vault: &Vault, _now: u64) {}
+
+    /// Returns the vault activity log (alias for get_vault_audit_log).
+    pub fn get_vault_activity_log(env: Env, vault_id: u64) -> Vec<AuditEntry> {
+        Self::get_vault_audit_log(env, vault_id)
+    }
+
+    /// Transfers vault ownership immediately (single-step, backwards-compatible).
+    pub fn transfer_ownership(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        new_owner: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if new_owner == vault.beneficiary {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+        let old_owner = vault.owner.clone();
+        if old_owner != new_owner {
+            Self::remove_owner_vault_id(&env, &old_owner, vault_id, vault.check_in_interval);
+            Self::add_owner_vault_id(&env, &new_owner, vault_id, vault.check_in_interval);
+        }
+        vault.owner = new_owner.clone();
+        Self::save_vault(&env, vault_id, &vault);
+        Self::log_audit_entry(&env, vault_id, "transfer_ownership", &caller, "");
+        Self::append_activity_log(&env, vault_id, "transfer_ownership", &caller, "");
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((OWNERSHIP_TOPIC, vault_id), (old_owner, new_owner));
+        Ok(())
+    }
+
+    // ── Issue: TTL Borrowing ──────────────────────────────────────────────────
+
+    /// Temporarily borrows TTL from a lender vault to extend a borrower vault's expiry.
+    ///
+    /// The lender's remaining TTL is reduced by `borrow_seconds`; the borrower's
+    /// `last_check_in` is extended by the same amount. Only the borrower vault owner
+    /// may call this. A `TtlBorrowRecord` is stored for auditability and repayment.
+    ///
+    /// # Errors
+    /// * `Paused`              - contract is paused
+    /// * `NotOwner`            - caller is not borrower vault owner
+    /// * `AlreadyReleased`     - either vault is not Locked
+    /// * `InvalidAmount`       - borrow_seconds is 0 or vaults are the same
+    /// * `InsufficientBalance` - lender does not have enough remaining TTL
+    pub fn borrow_ttl(
+        env: Env,
+        borrower_vault_id: u64,
+        lender_vault_id: u64,
+        caller: Address,
+        borrow_seconds: u64,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        if borrow_seconds == 0 || borrower_vault_id == lender_vault_id {
+            return Err(ContractError::InvalidAmount);
+        }
+        let mut borrower = Self::load_vault(&env, borrower_vault_id);
+        if caller != borrower.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if borrower.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let mut lender = Self::load_vault(&env, lender_vault_id);
+        if lender.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let now = env.ledger().timestamp();
+        let lender_deadline = lender.last_check_in + lender.check_in_interval;
+        let lender_remaining = if now >= lender_deadline { 0u64 } else { lender_deadline - now };
+        if lender_remaining <= borrow_seconds {
+            return Err(ContractError::InsufficientBalance);
+        }
+        borrower.last_check_in = borrower.last_check_in.saturating_add(borrow_seconds);
+        lender.last_check_in = lender.last_check_in.saturating_sub(borrow_seconds);
+        let record = TtlBorrowRecord {
+            lender_vault_id,
+            borrower_vault_id,
+            borrowed_seconds: borrow_seconds,
+            borrowed_at: now,
+            repaid: false,
+        };
+        let key = DataKey::TtlBorrow(borrower_vault_id);
+        let ttl = vault_ttl_ledgers(borrower.check_in_interval);
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        Self::save_vault(&env, borrower_vault_id, &borrower);
+        Self::save_vault(&env, lender_vault_id, &lender);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (TTL_BORROW_TOPIC, borrower_vault_id),
+            (lender_vault_id, borrow_seconds, now),
+        );
+        Ok(())
+    }
+
+    /// Repays a TTL borrow, restoring the lender vault's TTL.
+    ///
+    /// # Errors
+    /// * `NotOwner`               - caller is not borrower vault owner
+    /// * `TtlBorrowNotFound`      - no borrow record exists
+    /// * `TtlBorrowAlreadyRepaid` - borrow was already repaid
+    pub fn repay_ttl_borrow(
+        env: Env,
+        borrower_vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let borrower = Self::load_vault(&env, borrower_vault_id);
+        if caller != borrower.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let key = DataKey::TtlBorrow(borrower_vault_id);
+        let mut record: TtlBorrowRecord = env
+            .storage().persistent().get(&key)
+            .ok_or(ContractError::TtlBorrowNotFound)?;
+        if record.repaid {
+            return Err(ContractError::TtlBorrowAlreadyRepaid);
+        }
+        let mut lender = Self::load_vault(&env, record.lender_vault_id);
+        lender.last_check_in = lender.last_check_in.saturating_add(record.borrowed_seconds);
+        Self::save_vault(&env, record.lender_vault_id, &lender);
+        record.repaid = true;
+        env.storage().persistent().set(&key, &record);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (TTL_REPAY_TOPIC, borrower_vault_id),
+            (record.lender_vault_id, record.borrowed_seconds),
+        );
+        Ok(())
+    }
+
+    /// Returns the active TTL borrow record for a vault, if any.
+    pub fn get_ttl_borrow(env: Env, borrower_vault_id: u64) -> Option<TtlBorrowRecord> {
+        env.storage().persistent().get(&DataKey::TtlBorrow(borrower_vault_id))
     }
 
     fn append_activity_log(env: &Env, vault_id: u64, action: &str, caller: &Address, _details: &str) {

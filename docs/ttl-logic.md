@@ -90,3 +90,19 @@ To restore an archived vault:
 3. The vault becomes accessible again with extended TTL
 
 The `trigger_release` function automatically attempts restoration if the vault is archived.
+
+## TTL Borrowing (Emergency)
+
+Vault owners can temporarily borrow TTL from another vault they own during emergencies:
+
+```rust
+borrow_ttl(borrower_vault_id, lender_vault_id, caller, borrow_seconds) -> Result<(), ContractError>
+repay_ttl_borrow(borrower_vault_id, caller) -> Result<(), ContractError>
+get_ttl_borrow(borrower_vault_id) -> Option<TtlBorrowRecord>
+```
+
+- The lender vault's `last_check_in` is reduced by `borrow_seconds` (shortening its TTL)
+- The borrower vault's `last_check_in` is extended by `borrow_seconds` (pushing its expiry forward)
+- A `TtlBorrowRecord` is stored on-chain for auditability
+- The borrow can be repaid to restore the lender's TTL
+- Events: `ttl_bor` (borrow created), `ttl_rep` (borrow repaid)

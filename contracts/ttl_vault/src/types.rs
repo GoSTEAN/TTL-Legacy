@@ -63,6 +63,16 @@ pub const META_REVERT_TOPIC: Symbol = symbol_short!("meta_rev");
 pub const VAULT_ARCHIVED_TOPIC: Symbol = symbol_short!("v_arch");
 pub const VAULT_CAP_TOPIC: Symbol = symbol_short!("v_cap");
 
+// Previously missing — used by lib.rs internal helpers
+pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
+pub const OWNERSHIP_PROOF_TOPIC: Symbol = symbol_short!("own_prf");
+pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
+pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("bat_stat");
+
+// Issue: TTL Borrowing
+pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
+pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -123,6 +133,20 @@ pub enum DataKey {
     MultiSigProposalCount(u64),
     MetadataHistory(u64),
     OwnerVaultCount(Address),
+    // Issue: TTL Borrowing
+    TtlBorrow(u64),
+    StateTransitionLog(u64),
+}
+
+/// TTL borrow record — tracks an active emergency TTL loan between vaults.
+#[contracttype]
+#[derive(Clone)]
+pub struct TtlBorrowRecord {
+    pub lender_vault_id: u64,
+    pub borrower_vault_id: u64,
+    pub borrowed_seconds: u64,
+    pub borrowed_at: u64,
+    pub repaid: bool,
 }
 
 /// A vesting schedule attached to a vault.

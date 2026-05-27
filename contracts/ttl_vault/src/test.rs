@@ -3718,3 +3718,126 @@ fn test_merge_vaults_same_token_succeeds() {
     client.merge_vaults(&target, &sources, &owner).unwrap();
     assert_eq!(client.get_vault(&target).balance, 50_000i128);
 }
+
+// ============================================================
+// Issue: TTL Borrowing — tests
+// ============================================================
+
+#[test]
+fn test_borrow_ttl_extends_borrower_and_shortens_lender() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let b2 = Address::generate(&env);
+    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+
+    let lender_before = client.get_vault(&lender_id).last_check_in;
+    let borrower_before = client.get_vault(&borrower_id).last_check_in;
+
+    client.borrow_ttl(&borrower_id, &lender_id, &owner, &1_000u64).unwrap();
+
+    assert_eq!(client.get_vault(&borrower_id).last_check_in, borrower_before + 1_000);
+    assert_eq!(client.get_vault(&lender_id).last_check_in, lender_before - 1_000);
+}
+
+#[test]
+fn test_borrow_ttl_records_borrow_entry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let b2 = Address::generate(&env);
+    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+
+    client.borrow_ttl(&borrower_id, &lender_id, &owner, &500u64).unwrap();
+
+    let record = client.get_ttl_borrow(&borrower_id).expect("borrow record should exist");
+    assert_eq!(record.lender_vault_id, lender_id);
+    assert_eq!(record.borrowed_seconds, 500);
+    assert!(!record.repaid);
+}
+
+#[test]
+fn test_borrow_ttl_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let b2 = Address::generate(&env);
+    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+
+    client.borrow_ttl(&borrower_id, &lender_id, &owner, &500u64).unwrap();
+    assert!(find_event_by_topic(&env, types::TTL_BORROW_TOPIC));
+}
+
+#[test]
+fn test_borrow_ttl_fails_when_lender_has_insufficient_ttl() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let b2 = Address::generate(&env);
+    let lender_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+
+    let result = client.try_borrow_ttl(&borrower_id, &lender_id, &owner, &200u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_borrow_ttl_fails_for_non_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let b2 = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+
+    let result = client.try_borrow_ttl(&borrower_id, &lender_id, &attacker, &500u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_borrow_ttl_fails_same_vault() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let result = client.try_borrow_ttl(&vault_id, &vault_id, &owner, &500u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_repay_ttl_borrow_restores_lender() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let b2 = Address::generate(&env);
+    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+
+    let lender_before = client.get_vault(&lender_id).last_check_in;
+    client.borrow_ttl(&borrower_id, &lender_id, &owner, &1_000u64).unwrap();
+    client.repay_ttl_borrow(&borrower_id, &owner).unwrap();
+
+    assert_eq!(client.get_vault(&lender_id).last_check_in, lender_before);
+    assert!(client.get_ttl_borrow(&borrower_id).unwrap().repaid);
+}
+
+#[test]
+fn test_repay_ttl_borrow_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let b2 = Address::generate(&env);
+    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+
+    client.borrow_ttl(&borrower_id, &lender_id, &owner, &500u64).unwrap();
+    client.repay_ttl_borrow(&borrower_id, &owner).unwrap();
+    assert!(find_event_by_topic(&env, types::TTL_REPAY_TOPIC));
+}
+
+#[test]
+fn test_repay_ttl_borrow_fails_when_already_repaid() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let b2 = Address::generate(&env);
+    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+
+    client.borrow_ttl(&borrower_id, &lender_id, &owner, &500u64).unwrap();
+    client.repay_ttl_borrow(&borrower_id, &owner).unwrap();
+    assert!(client.try_repay_ttl_borrow(&borrower_id, &owner).is_err());
+}
+
+#[test]
+fn test_repay_ttl_borrow_fails_when_no_record() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    assert!(client.try_repay_ttl_borrow(&vault_id, &owner).is_err());
+}
