@@ -80,22 +80,24 @@ pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
 // Issue #475: batch status query
 pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("b_stat");
 
-// Previously missing topics referenced in lib.rs
+// Previously missing — used by lib.rs internal helpers
 pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
 pub const OWNERSHIP_PROOF_TOPIC: Symbol = symbol_short!("own_prf");
-pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integrity");
+pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
 pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("bat_stat");
 
-// Shared TTL Pool events
-pub const TTL_POOL_CREATED_TOPIC: Symbol = symbol_short!("pool_new");
-pub const TTL_POOL_VAULT_ADDED_TOPIC: Symbol = symbol_short!("pool_add");
-pub const TTL_POOL_VAULT_REMOVED_TOPIC: Symbol = symbol_short!("pool_rm");
-pub const TTL_POOL_CHECK_IN_TOPIC: Symbol = symbol_short!("pool_ci");
+// Issue: TTL Borrowing
+pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
+pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
 
-// Biometric verification events
-pub const BIOMETRIC_REGISTERED_TOPIC: Symbol = symbol_short!("bio_reg");
-pub const BIOMETRIC_REMOVED_TOPIC: Symbol = symbol_short!("bio_rm");
-pub const BIOMETRIC_CHECK_IN_TOPIC: Symbol = symbol_short!("bio_ci");
+// Issue: Check-in Rate Limiting
+pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
+
+// Issue: Accelerated TTL Decay
+pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
+
+// Issue: Geographic Check-in Tracking
+pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours

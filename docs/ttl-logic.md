@@ -91,38 +91,66 @@ To restore an archived vault:
 
 The `trigger_release` function automatically attempts restoration if the vault is archived.
 
-## Shared TTL Pool
+## TTL Borrowing (Emergency)
 
-Multiple vaults can share a common TTL pool for more efficient storage management. Instead of each vault requiring its own check-in transaction, a single `pool_check_in` resets `last_check_in` for all member vaults simultaneously.
-
-### Pool Lifecycle
-
-1. Owner calls `create_ttl_pool(owner, check_in_interval)` → returns `pool_id`
-2. Vault owners call `add_vault_to_pool(pool_id, vault_id, caller)` to join
-3. Pool owner calls `pool_check_in(pool_id, caller)` to reset all member vaults
-4. Vault owners call `remove_vault_from_pool(vault_id, caller)` to leave
-
-### Pool API
+Vault owners can temporarily borrow TTL from another vault they own during emergencies:
 
 ```rust
-create_ttl_pool(owner: Address, check_in_interval: u64) -> u64
-add_vault_to_pool(pool_id: u64, vault_id: u64, caller: Address) -> Result<(), ContractError>
-remove_vault_from_pool(vault_id: u64, caller: Address) -> Result<(), ContractError>
-pool_check_in(pool_id: u64, caller: Address) -> Result<(), ContractError>
-get_ttl_pool(pool_id: u64) -> Option<TtlPool>
-get_pool_vaults(pool_id: u64) -> Vec<u64>
-get_vault_pool(vault_id: u64) -> Option<u64>
+borrow_ttl(borrower_vault_id, lender_vault_id, caller, borrow_seconds) -> Result<(), ContractError>
+repay_ttl_borrow(borrower_vault_id, caller) -> Result<(), ContractError>
+get_ttl_borrow(borrower_vault_id) -> Option<TtlBorrowRecord>
 ```
 
-### Events
+- The lender vault's `last_check_in` is reduced by `borrow_seconds` (shortening its TTL)
+- The borrower vault's `last_check_in` is extended by `borrow_seconds` (pushing its expiry forward)
+- A `TtlBorrowRecord` is stored on-chain for auditability
+- The borrow can be repaid to restore the lender's TTL
+- Events: `ttl_bor` (borrow created), `ttl_rep` (borrow repaid)
 
-| Topic | Data | Description |
-|---|---|---|
-| `pool_new` | `(pool_id, owner, interval, timestamp)` | Pool created |
-| `pool_add` | `(pool_id, vault_id)` | Vault added to pool |
-| `pool_rm` | `(pool_id, vault_id)` | Vault removed from pool |
-| `pool_ci` | `(pool_id, timestamp, member_count)` | Pool check-in performed |
+## Check-in Rate Limiting
 
-### Storage Efficiency
+To prevent storage abuse from excessive check-ins, a minimum cooldown can be enforced:
 
-Without a pool, N vaults require N separate check-in transactions. With a pool, a single `pool_check_in` updates all N vaults in one transaction, reducing ledger fees and simplifying owner workflows. Released vaults in a pool are silently skipped.
+```rust
+set_min_checkin_cooldown(cooldown_seconds)   // admin-only
+get_min_checkin_cooldown() -> u64
+get_last_checkin_time(vault_id) -> Option<u64>
+```
+
+- Default cooldown: 60 seconds
+- Set to 0 to disable rate limiting
+- Check-ins within the cooldown window return `CheckInTooFrequent` (error 54)
+- Event: `ci_rl` emitted when the cooldown setting is updated
+
+## Accelerated TTL Decay
+
+Owners can voluntarily shorten their vault's remaining TTL to make it expire sooner:
+
+```rust
+accelerate_ttl_decay(vault_id, caller, accelerate_by_seconds) -> Result<(), ContractError>
+```
+
+- Reduces `last_check_in` by `accelerate_by_seconds`, moving the expiry deadline forward
+- Capped at 30 days (`MAX_ACCELERATE_SECONDS = 2_592_000`) per call
+- Cannot push expiry to the current time or past (must leave ≥ 1 second remaining)
+- Returns `InsufficientTtlToAccelerate` (error 55) if the remaining TTL is too small
+- Event: `ttl_acc` with `(accelerated_seconds, new_remaining_ttl)`
+
+## Geographic Check-in Tracking
+
+Check-ins can include geographic location metadata for security and anomaly detection:
+
+```rust
+check_in_with_geo(
+    vault_id, caller, passkey_hash,
+    latitude_micro, longitude_micro, country_code
+) -> Result<(), ContractError>
+get_geo_checkin_log(vault_id) -> Vec<GeoCheckInEntry>
+```
+
+- `latitude_micro` / `longitude_micro` are in microdegrees (e.g. `37_422_000` = 37.422°)
+- `country_code` is an ISO 3166-1 alpha-2 string (e.g. `"US"`)
+- All standard `check_in` validations apply (owner auth, rate limiting, passkey expiry, TTL cap)
+- Location history is stored persistently under `CheckInGeoLog(vault_id)` and queryable on-chain
+- Off-chain indexers can detect anomalies (e.g. check-in from unexpected country)
+- Events: `ci_geo` (location + timestamp) and `check_in` (standard check-in event)
