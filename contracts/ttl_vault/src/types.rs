@@ -79,6 +79,11 @@ pub const OWNERSHIP_PROOF_TOPIC: Symbol = symbol_short!("own_prf");
 pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
 // Issue #475: batch status query
 pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("b_stat");
+// Issue #498: beneficiary proof of life
+pub const PROOF_OF_LIFE_TOPIC: Symbol = symbol_short!("pol_sub");
+// Issue #499: beneficiary voting
+pub const RELEASE_VOTE_TOPIC: Symbol = symbol_short!("rel_vote");
+pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
 
 // Previously missing — used by lib.rs internal helpers
 pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
@@ -170,6 +175,11 @@ pub enum DataKey {
     CheckInNonce(u64),
     // Issue #480: check-in delegates
     CheckInDelegates(u64),
+    // Issue #498: beneficiary proof of life
+    ProofOfLife(u64),
+    // Issue #499: beneficiary release votes
+    ReleaseVotes(u64),
+    ReleaseVoteThreshold(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
