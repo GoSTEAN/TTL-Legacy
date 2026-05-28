@@ -68,85 +68,81 @@ is_valid_biometric(vault_id: u64, credential_hash: BytesN<32>) -> bool
 - Raw biometric data is never stored on-chain — only the hash commitment
 - Check-in on a Released vault is rejected with `AlreadyReleased`
 
-## Backup Code Encryption (Issue #553)
+## Passkey Expiry Enforcement (Issue #549)
 
-Backup codes can be stored on-chain in encrypted form so only the vault owner can recover them.
+Every call to `check_in`, `check_in_with_pow`, and `batch_check_in_v2` now
+enforces two sequential validations before updating `last_check_in`:
 
-### How It Works
+### 1. Registration Check
 
-1. The client generates 10 backup codes off-chain.
-2. The client encrypts the codes using the owner's X25519 public key (NaCl box: XSalsa20-Poly1305).
-3. The encrypted payload (`nonce || ciphertext`) is submitted to the contract via `store_encrypted_backup_codes`.
-4. The contract stores the payload alongside the owner's public key and a timestamp.
-5. Only the owner's private key can decrypt the payload — the contract never sees plaintext codes.
+| Passkey state | Behaviour |
+|---|---|
+| `VaultPasskeys` list non-empty | Hash **must** appear in the list; otherwise `InvalidPasskey` |
+| List empty, `vault.passkey_hash` is `Some` | Hash **must** match the primary passkey; otherwise `InvalidPasskey` |
+| Both empty/None | Any hash accepted (no passkey configured — backwards compatible) |
 
-### API
+### 2. Expiry Check
+
+If `extend_passkey_expiry` was previously called for this hash, the stored expiry
+timestamp is compared with the current ledger time.  If `now > expiry`:
+
+- A `pk_expd` event is emitted with the passkey hash.
+- The call returns `PasskeyExpired` (error code 59) — distinct from `InvalidPasskey`.
+
+### Errors
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 26 | `InvalidPasskey` | Passkey not registered for this vault |
+| 59 | `PasskeyExpired`  | Passkey registration has expired |
+
+## Passkey Compromise Detection (Issue #550)
+
+See the dedicated compromise detection section below.
+
+### `report_passkey_compromise`
 
 ```rust
-store_encrypted_backup_codes(
+fn report_passkey_compromise(
+    env: Env,
     vault_id: u64,
-    caller: Address,
-    owner_pubkey: BytesN<32>,
-    encrypted_payload: Bytes,
+    caller: Address,    // must be vault owner
+    passkey_hash: BytesN<32>,
 ) -> Result<(), ContractError>
-
-get_encrypted_backup_codes(vault_id: u64) -> Option<EncryptedBackupCodes>
 ```
 
-### Events
+Manually flags a passkey as compromised. Subsequent `check_in` calls using that
+hash return `PasskeyCompromised` (error 62).
 
-| Topic   | Data                          | Description                          |
-|---------|-------------------------------|--------------------------------------|
-| `bk_enc`| `(owner_pubkey, generated_at)`| Encrypted backup codes stored        |
-
-### Security Properties
-
-- Encryption is performed entirely client-side; the contract stores only opaque ciphertext.
-- Overwriting is allowed — calling `store_encrypted_backup_codes` again replaces the previous entry.
-- Only the vault owner (authenticated via `caller.require_auth()`) can store encrypted codes.
-- Storing is rejected on Released vaults with `AlreadyReleased`.
-
-## Passkey Usage Analytics (Issue #554)
-
-Detailed per-passkey usage statistics are available for security auditing.
-
-### How It Works
-
-Every `check_in` call appends a `PasskeyUsageEntry` (passkey hash + timestamp) to persistent storage. The `get_passkey_analytics` function aggregates this log into a `PasskeyAnalytics` report.
-
-### API
+### `clear_passkey_compromise`
 
 ```rust
-get_passkey_analytics(vault_id: u64) -> PasskeyAnalytics
+fn clear_passkey_compromise(
+    env: Env,
+    vault_id: u64,
+    caller: Address,    // must be vault owner
+    passkey_hash: BytesN<32>,
+) -> Result<(), ContractError>
 ```
 
-### PasskeyAnalytics Fields
+Removes the compromise flag, allowing the passkey to be used again.
 
-| Field             | Type                      | Description                                  |
-|-------------------|---------------------------|----------------------------------------------|
-| `vault_id`        | `u64`                     | The vault being queried                      |
-| `total_uses`      | `u32`                     | Total number of passkey check-ins            |
-| `unique_passkeys` | `u32`                     | Number of distinct passkeys used             |
-| `last_used`       | `u64`                     | Timestamp of the most recent check-in        |
-| `per_passkey`     | `Vec<PasskeyUsageStat>`   | Per-passkey breakdown                        |
+### `is_passkey_compromised`
 
-Each `PasskeyUsageStat` contains:
+```rust
+fn is_passkey_compromised(env: Env, vault_id: u64, passkey_hash: BytesN<32>) -> bool
+```
 
-| Field          | Type          | Description                              |
-|----------------|---------------|------------------------------------------|
-| `passkey_hash` | `BytesN<32>`  | The passkey identifier                   |
-| `use_count`    | `u32`         | How many times this passkey was used     |
-| `first_used`   | `u64`         | Timestamp of first use                   |
-| `last_used`    | `u64`         | Timestamp of most recent use             |
+### Automatic Detection
+
+During every `check_in`, the contract inspects the last 5 passkey usage entries.
+If 3 or more **consecutive** entries used **different** passkey hashes, a
+`pk_comp` event is emitted as an advisory alert (the check-in is not blocked).
+Owners should monitor for this event and rotate or revoke suspected passkeys.
 
 ### Events
 
-| Topic     | Data                          | Description                          |
-|-----------|-------------------------------|--------------------------------------|
-| `pk_anly` | `(total_uses, unique_passkeys)`| Analytics query performed            |
-
-### Use Cases
-
-- Detect dormant passkeys (not used recently) for rotation reminders.
-- Identify which device/passkey is most active.
-- Audit unusual check-in patterns for security review.
+| Topic | Data | Emitted when |
+|---|---|---|
+| `pk_expd` | `passkey_hash` | Expired passkey used in check-in |
+| `pk_comp` | `(vault_id, passkey_hash)` | Compromise detected or reported |
