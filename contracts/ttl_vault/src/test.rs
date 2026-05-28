@@ -4083,330 +4083,178 @@ fn test_get_release_votes_empty_by_default() {
     assert_eq!(client.get_release_votes(&id).len(), 0);
 }
 
-// ── Issue #494: Beneficiary Succession Planning ───────────────────────────────
+// ── Hibernation ───────────────────────────────────────────────────────────────
 
 #[test]
-fn test_set_and_get_succession_plan() {
+fn test_enter_hibernation_success() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let successor = Address::generate(&env);
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.set_succession_plan(&id, &owner, &successor, &0u64).unwrap();
-    let plan = client.get_succession_plan(&id).unwrap();
-    assert_eq!(plan.successor, successor);
-    assert!(!plan.activated);
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+
+    let h = client.get_hibernation(&id).unwrap();
+    assert_eq!(h.duration_seconds, 7200u64);
 }
 
 #[test]
-fn test_set_succession_plan_non_owner_fails() {
+fn test_enter_hibernation_non_owner_fails() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let successor = Address::generate(&env);
     let stranger = Address::generate(&env);
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    let err = client.try_set_succession_plan(&id, &stranger, &successor, &0u64).unwrap_err().unwrap();
+    let err = client.try_enter_hibernation(&id, &stranger, &3600u64).unwrap_err().unwrap();
     assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
 }
 
 #[test]
-fn test_set_succession_plan_owner_as_successor_fails() {
+fn test_enter_hibernation_zero_duration_fails() {
     let (_, owner, beneficiary, _, _, client) = setup();
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    let err = client.try_set_succession_plan(&id, &owner, &owner, &0u64).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(17)); // InvalidBeneficiary
+    let err = client.try_enter_hibernation(&id, &owner, &0u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(2)); // InvalidInterval
 }
 
 #[test]
-fn test_activate_succession_updates_beneficiary() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let successor = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.set_succession_plan(&id, &owner, &successor, &0u64).unwrap();
-    client.activate_succession(&id, &owner).unwrap();
-
-    let plan = client.get_succession_plan(&id).unwrap();
-    assert!(plan.activated);
-    // Vault beneficiary should now be the successor
-    let vault = client.get_vault(&id);
-    assert_eq!(vault.beneficiary, successor);
-}
-
-#[test]
-fn test_activate_succession_twice_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let successor = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.set_succession_plan(&id, &owner, &successor, &0u64).unwrap();
-    client.activate_succession(&id, &owner).unwrap();
-    let err = client.try_activate_succession(&id, &owner).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(56)); // SuccessionAlreadyActivated
-}
-
-#[test]
-fn test_activate_succession_no_plan_fails() {
+fn test_enter_hibernation_already_hibernating_fails() {
     let (_, owner, beneficiary, _, _, client) = setup();
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    let err = client.try_activate_succession(&id, &owner).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // SuccessionNotSet
+    client.enter_hibernation(&id, &owner, &3600u64).unwrap();
+    let err = client.try_enter_hibernation(&id, &owner, &3600u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // AlreadyHibernating
 }
 
-// ── Issue #495: Beneficiary Escrow ────────────────────────────────────────────
+#[test]
+fn test_vault_not_expired_during_hibernation() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let interval = 3600u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+
+    // Advance past the normal check-in interval — vault should NOT be expired
+    env.ledger().with_mut(|l| l.timestamp += interval + 1);
+    assert!(!client.is_expired(&id));
+}
 
 #[test]
-fn test_create_and_get_escrow() {
-    let (_, owner, beneficiary, _, token_address, client) = setup();
+fn test_vault_expires_after_hibernation_window_closes() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let interval = 3600u64;
+    let hibernation = 7200u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+
+    client.enter_hibernation(&id, &owner, &hibernation).unwrap();
+
+    // Advance past interval + hibernation — vault should now be expired
+    env.ledger().with_mut(|l| l.timestamp += interval + hibernation + 1);
+    assert!(client.is_expired(&id));
+}
+
+#[test]
+fn test_exit_hibernation_success() {
+    let (env, owner, beneficiary, _, _, client) = setup();
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
 
-    client.create_escrow(&id, &owner, &3600u64).unwrap();
-    let escrow = client.get_escrow(&id).unwrap();
-    assert_eq!(escrow.amount, 1000);
-    assert_eq!(escrow.beneficiary, beneficiary);
-    assert!(!escrow.accepted);
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 1000);
+    client.exit_hibernation(&id, &owner).unwrap();
+
+    // Hibernation entry should be gone
+    assert!(client.get_hibernation(&id).is_none());
 }
 
 #[test]
-fn test_create_escrow_non_owner_fails() {
+fn test_exit_hibernation_non_owner_fails() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let stranger = Address::generate(&env);
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
 
-    let err = client.try_create_escrow(&id, &stranger, &3600u64).unwrap_err().unwrap();
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    let err = client.try_exit_hibernation(&id, &stranger).unwrap_err().unwrap();
     assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
 }
 
 #[test]
-fn test_create_escrow_empty_vault_fails() {
+fn test_exit_hibernation_not_hibernating_fails() {
     let (_, owner, beneficiary, _, _, client) = setup();
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    let err = client.try_create_escrow(&id, &owner, &3600u64).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(4)); // EmptyVault
+    let err = client.try_exit_hibernation(&id, &owner).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(56)); // NotHibernating
 }
 
 #[test]
-fn test_accept_escrow_transfers_funds() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
-    client.create_escrow(&id, &owner, &3600u64).unwrap();
-
-    let before = token::Client::new(&env, &token_address).balance(&beneficiary);
-    client.accept_escrow(&id, &beneficiary).unwrap();
-    let after = token::Client::new(&env, &token_address).balance(&beneficiary);
-    assert_eq!(after - before, 1000);
-    assert!(client.get_escrow(&id).unwrap().accepted);
-}
-
-#[test]
-fn test_accept_escrow_non_beneficiary_fails() {
+fn test_exit_hibernation_credits_elapsed_time() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let stranger = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
-    client.create_escrow(&id, &owner, &3600u64).unwrap();
+    let interval = 3600u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+    let before = client.get_vault(&id).last_check_in;
 
-    let err = client.try_accept_escrow(&id, &stranger).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(30)); // NotBeneficiary
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    let elapsed = 1000u64;
+    env.ledger().with_mut(|l| l.timestamp += elapsed);
+    client.exit_hibernation(&id, &owner).unwrap();
+
+    let after = client.get_vault(&id).last_check_in;
+    assert_eq!(after, before + elapsed);
 }
 
 #[test]
-fn test_reject_escrow_returns_funds_to_owner() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
-    client.create_escrow(&id, &owner, &3600u64).unwrap();
+fn test_vault_not_expired_after_early_exit_within_interval() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let interval = 3600u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
 
-    let before = token::Client::new(&env, &token_address).balance(&owner);
-    client.reject_escrow(&id, &beneficiary).unwrap();
-    let after = token::Client::new(&env, &token_address).balance(&owner);
-    assert_eq!(after - before, 1000);
-    assert!(client.get_escrow(&id).is_none());
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    // Exit after 1000 s — last_check_in bumped by 1000
+    env.ledger().with_mut(|l| l.timestamp += 1000);
+    client.exit_hibernation(&id, &owner).unwrap();
+
+    // Total elapsed from original last_check_in = 1000 s, interval = 3600 s → not expired
+    assert!(!client.is_expired(&id));
 }
 
 #[test]
-fn test_expire_escrow_returns_funds_to_owner() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
+fn test_hibernation_emits_entered_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
-    client.create_escrow(&id, &owner, &3600u64).unwrap();
 
-    // Advance time past expiry
-    env.ledger().with_mut(|l| l.timestamp += 3601);
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
 
-    let before = token::Client::new(&env, &token_address).balance(&owner);
-    client.expire_escrow(&id).unwrap();
-    let after = token::Client::new(&env, &token_address).balance(&owner);
-    assert_eq!(after - before, 1000);
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.0.try_into_val(&env).unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
+        if topics.is_empty() { return false; }
+        let first: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        first.map(|s| s == soroban_sdk::Symbol::new(&env, "hib_ent")).unwrap_or(false)
+    });
+    assert!(found, "hibernation_entered event not emitted");
 }
 
 #[test]
-fn test_expire_escrow_before_expiry_fails() {
+fn test_hibernation_emits_exited_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 500);
+    client.exit_hibernation(&id, &owner).unwrap();
+
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.0.try_into_val(&env).unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
+        if topics.is_empty() { return false; }
+        let first: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        first.map(|s| s == soroban_sdk::Symbol::new(&env, "hib_ext")).unwrap_or(false)
+    });
+    assert!(found, "hibernation_exited event not emitted");
+}
+
+#[test]
+fn test_get_hibernation_returns_none_when_not_hibernating() {
     let (_, owner, beneficiary, _, _, client) = setup();
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
-    client.create_escrow(&id, &owner, &3600u64).unwrap();
-
-    let err = client.try_expire_escrow(&id).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(16)); // NotExpired
-}
-
-// ── Issue #496: Beneficiary Dispute Arbitration ───────────────────────────────
-
-#[test]
-fn test_set_and_get_arbitration_config() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let arbitrator = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.set_arbitrator(&id, &owner, &arbitrator).unwrap();
-    let config = client.get_arbitration_config(&id).unwrap();
-    assert_eq!(config.arbitrator, arbitrator);
-    assert!(!config.ruled);
-}
-
-#[test]
-fn test_set_arbitrator_non_owner_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let arbitrator = Address::generate(&env);
-    let stranger = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    let err = client.try_set_arbitrator(&id, &stranger, &arbitrator).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
-}
-
-#[test]
-fn test_arbitrate_dispute_rules_for_beneficiary() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-    let arbitrator = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
-    client.set_arbitrator(&id, &owner, &arbitrator).unwrap();
-    client.file_dispute(&id, &soroban_sdk::String::from_str(&env, "dispute reason")).unwrap();
-
-    let before = token::Client::new(&env, &token_address).balance(&beneficiary);
-    client.arbitrate_dispute(&id, &arbitrator, &true).unwrap();
-    let after = token::Client::new(&env, &token_address).balance(&beneficiary);
-    assert_eq!(after - before, 1000);
-
-    let config = client.get_arbitration_config(&id).unwrap();
-    assert!(config.ruled);
-    assert!(config.ruling);
-}
-
-#[test]
-fn test_arbitrate_dispute_rules_for_owner() {
-    let (env, owner, beneficiary, _, token_address, client) = setup();
-    let arbitrator = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
-    client.set_arbitrator(&id, &owner, &arbitrator).unwrap();
-    client.file_dispute(&id, &soroban_sdk::String::from_str(&env, "dispute reason")).unwrap();
-
-    let before = token::Client::new(&env, &token_address).balance(&owner);
-    client.arbitrate_dispute(&id, &arbitrator, &false).unwrap();
-    let after = token::Client::new(&env, &token_address).balance(&owner);
-    assert_eq!(after - before, 1000);
-}
-
-#[test]
-fn test_arbitrate_dispute_non_arbitrator_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let arbitrator = Address::generate(&env);
-    let stranger = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
-    client.set_arbitrator(&id, &owner, &arbitrator).unwrap();
-    client.file_dispute(&id, &soroban_sdk::String::from_str(&env, "reason")).unwrap();
-
-    let err = client.try_arbitrate_dispute(&id, &stranger, &true).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(62)); // NotArbitrator
-}
-
-#[test]
-fn test_arbitrate_dispute_no_arbitrator_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.file_dispute(&id, &soroban_sdk::String::from_str(&env, "reason")).unwrap();
-
-    let err = client.try_arbitrate_dispute(&id, &owner, &true).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(60)); // ArbitratorNotSet
-}
-
-#[test]
-fn test_arbitrate_dispute_double_ruling_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let arbitrator = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
-    client.set_arbitrator(&id, &owner, &arbitrator).unwrap();
-    client.file_dispute(&id, &soroban_sdk::String::from_str(&env, "reason")).unwrap();
-    client.arbitrate_dispute(&id, &arbitrator, &true).unwrap();
-
-    let err = client.try_arbitrate_dispute(&id, &arbitrator, &false).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(61)); // ArbitrationAlreadyRuled
-}
-
-// ── Issue #497: Beneficiary Notification System ───────────────────────────────
-
-#[test]
-fn test_notify_beneficiary_appends_log() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.notify_beneficiary(&id, &owner, &soroban_sdk::String::from_str(&env, "released")).unwrap();
-    let log = client.get_notification_log(&id);
-    assert_eq!(log.len(), 1);
-    assert_eq!(log.get(0).unwrap().kind, soroban_sdk::String::from_str(&env, "released"));
-}
-
-#[test]
-fn test_notify_beneficiary_non_owner_fails() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let stranger = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    let err = client.try_notify_beneficiary(&id, &stranger, &soroban_sdk::String::from_str(&env, "test")).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
-}
-
-#[test]
-fn test_notification_log_empty_by_default() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    assert_eq!(client.get_notification_log(&id).len(), 0);
-}
-
-#[test]
-fn test_succession_activation_emits_notification() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let successor = Address::generate(&env);
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-
-    client.set_succession_plan(&id, &owner, &successor, &0u64).unwrap();
-    client.activate_succession(&id, &owner).unwrap();
-
-    // Succession activation should have appended a notification
-    let log = client.get_notification_log(&id);
-    assert_eq!(log.len(), 1);
-    assert_eq!(log.get(0).unwrap().kind, soroban_sdk::String::from_str(&env, "succession_activated"));
-}
-
-#[test]
-fn test_escrow_events_emit_notifications() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
-    client.deposit(&id, &owner, &1000i128);
-
-    client.create_escrow(&id, &owner, &3600u64).unwrap();
-    assert_eq!(client.get_notification_log(&id).len(), 1); // escrow_created
-
-    client.accept_escrow(&id, &beneficiary).unwrap();
-    assert_eq!(client.get_notification_log(&id).len(), 2); // escrow_accepted
+    assert!(client.get_hibernation(&id).is_none());
 }

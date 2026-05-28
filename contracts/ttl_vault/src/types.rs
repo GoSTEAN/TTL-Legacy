@@ -84,6 +84,9 @@ pub const PROOF_OF_LIFE_TOPIC: Symbol = symbol_short!("pol_sub");
 // Issue #499: beneficiary voting
 pub const RELEASE_VOTE_TOPIC: Symbol = symbol_short!("rel_vote");
 pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
+// Hibernation events
+pub const HIBERNATION_ENTERED_TOPIC: Symbol = symbol_short!("hib_ent");
+pub const HIBERNATION_EXITED_TOPIC: Symbol = symbol_short!("hib_ext");
 
 // Previously missing — used by lib.rs internal helpers
 pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
@@ -197,14 +200,8 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
-    // Issue #494: beneficiary succession
-    SuccessionPlan(u64),
-    // Issue #495: beneficiary escrow
-    EscrowEntry(u64),
-    // Issue #496: dispute arbitration
-    ArbitrationConfig(u64),
-    // Issue #497: notification log
-    NotificationLog(u64),
+    // Hibernation: temporary suspension of check-in requirement
+    Hibernation(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -563,60 +560,14 @@ pub struct BiometricEntry {
     pub added_at: u64,
 }
 
-/// Succession plan: if the primary beneficiary is unavailable, funds go to the successor.
-/// Issue #494
+/// Hibernation entry — records when a vault entered hibernation and for how long.
+/// While hibernating, the vault's expiry deadline is extended by `duration_seconds`,
+/// so no check-ins are required during that period.
 #[contracttype]
 #[derive(Clone)]
-pub struct SuccessionPlan {
-    /// Fallback beneficiary address.
-    pub successor: Address,
-    /// Unix timestamp after which the successor can claim (0 = immediately on activation).
-    pub activation_delay: u64,
-    /// Whether the succession has been activated.
-    pub activated: bool,
-    /// When the succession was activated (0 if not yet).
-    pub activated_at: u64,
-}
-
-/// Escrow entry: released funds are held pending beneficiary acceptance.
-/// Issue #495
-#[contracttype]
-#[derive(Clone)]
-pub struct EscrowEntry {
-    /// Amount held in escrow.
-    pub amount: i128,
-    /// Beneficiary who must accept.
-    pub beneficiary: Address,
-    /// Unix timestamp when the escrow was created.
-    pub created_at: u64,
-    /// Unix timestamp after which the escrow expires and funds return to owner.
-    pub expires_at: u64,
-    /// Whether the beneficiary has accepted.
-    pub accepted: bool,
-}
-
-/// Arbitration configuration for a vault.
-/// Issue #496
-#[contracttype]
-#[derive(Clone)]
-pub struct ArbitrationConfig {
-    /// Designated arbitrator address.
-    pub arbitrator: Address,
-    /// Whether an arbitration ruling has been issued.
-    pub ruled: bool,
-    /// Ruling: true = release to beneficiary, false = return to owner.
-    pub ruling: bool,
-    /// Timestamp of the ruling (0 if not yet ruled).
-    pub ruled_at: u64,
-}
-
-/// A single on-chain notification entry for a vault.
-/// Issue #497
-#[contracttype]
-#[derive(Clone)]
-pub struct NotificationEntry {
-    /// Short notification type tag (e.g. "released", "expired", "disputed").
-    pub kind: String,
-    /// Unix timestamp when the notification was emitted.
-    pub timestamp: u64,
+pub struct HibernationEntry {
+    /// Ledger timestamp when hibernation started.
+    pub started_at: u64,
+    /// How many seconds the hibernation lasts.
+    pub duration_seconds: u64,
 }

@@ -6,6 +6,7 @@ use soroban_sdk::{
 };
 
 mod types;
+pub mod ranking;
 use types::{
     BeneficiaryEntry, DataKey, ReleaseEvent, ReleaseStatus, ReleaseCondition, Vault, VestingSchedule,
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
@@ -38,11 +39,8 @@ use types::{
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
     ProofOfLifeEntry, ReleaseVoteEntry,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
-    SuccessionPlan, EscrowEntry, ArbitrationConfig, NotificationEntry,
-    SUCCESSION_SET_TOPIC, SUCCESSION_ACTIVATED_TOPIC,
-    ESCROW_CREATED_TOPIC, ESCROW_ACCEPTED_TOPIC, ESCROW_REJECTED_TOPIC, ESCROW_EXPIRED_TOPIC,
-    ARBITRATOR_SET_TOPIC, ARBITRATION_RULED_TOPIC,
-    VAULT_NOTIFY_TOPIC,
+    HibernationEntry,
+    HIBERNATION_ENTERED_TOPIC, HIBERNATION_EXITED_TOPIC,
 };
 
 #[cfg(test)]
@@ -153,17 +151,8 @@ pub enum ContractError {
     ProofOfLifeExpired = 52,
     AlreadyVoted = 53,
     VotingNotEnabled = 54,
-    // Issue #494
-    SuccessionNotSet = 55,
-    SuccessionAlreadyActivated = 56,
-    // Issue #495
-    EscrowNotFound = 57,
-    EscrowAlreadySettled = 58,
-    EscrowExpired = 59,
-    // Issue #496
-    ArbitratorNotSet = 60,
-    ArbitrationAlreadyRuled = 61,
-    NotArbitrator = 62,
+    AlreadyHibernating = 55,
+    NotHibernating = 56,
 }
 
 #[contract]
@@ -618,6 +607,15 @@ impl TtlVaultContract {
                 panic_with_error!(&env, ContractError::InvalidBeneficiary);
             }
 
+            // Detect duplicate: same (owner, beneficiary, check_in_interval) already Locked
+            let fingerprint = Self::vault_fingerprint(&env, &owner, &beneficiary, check_in_interval);
+            let fp_key = DataKey::VaultFingerprint(fingerprint.clone());
+            if env.storage().persistent().has(&fp_key) {
+                let existing_id: u64 = env.storage().persistent().get(&fp_key).unwrap();
+                env.events().publish((DUPLICATE_VAULT_TOPIC,), (owner, beneficiary, check_in_interval, existing_id));
+                panic_with_error!(&env, ContractError::DuplicateVault);
+            }
+
             // Issue #470: enforce per-owner vault capacity limit
             let limit: u32 = env.storage()
                 .instance()
@@ -691,6 +689,9 @@ impl TtlVaultContract {
             env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
             
             Self::append_activity_log(&env, vault_id, "create_vault", &owner, "");
+            // Store fingerprint to prevent duplicate creation
+            env.storage().persistent().set(&fp_key, &vault_id);
+            env.storage().persistent().extend_ttl(&fp_key, VAULT_TTL_THRESHOLD, vault_ttl_ledgers(check_in_interval));
             env.events().publish(
                 (VAULT_CREATED_TOPIC,),
                 (vault_id, owner, beneficiary, check_in_interval, timestamp),
@@ -1273,6 +1274,9 @@ impl TtlVaultContract {
                 let arch_key = DataKey::ArchivedVault(vault_id);
                 env.storage().persistent().set(&arch_key, &ArchivedVaultInfo(vault.clone()));
                 env.storage().persistent().extend_ttl(&arch_key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+                // Remove fingerprint so the same parameters can be reused
+                let fp = Self::vault_fingerprint(&env, &vault.owner, &vault.beneficiary, vault.check_in_interval);
+                env.storage().persistent().remove(&DataKey::VaultFingerprint(fp));
                 env.events().publish((VAULT_ARCHIVED_TOPIC, vault_id), (vault_id, ReleaseStatus::Released));
             }
             env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
@@ -2039,7 +2043,20 @@ impl TtlVaultContract {
     pub fn is_expired(env: Env, vault_id: u64) -> bool {
         let vault = Self::load_vault(&env, vault_id);
         let now = env.ledger().timestamp();
-        now >= vault.last_check_in + vault.check_in_interval
+        // Compute how many seconds of hibernation have elapsed (capped at duration).
+        let hibernated = if let Some(h) = env.storage().persistent()
+            .get::<DataKey, HibernationEntry>(&DataKey::Hibernation(vault_id))
+        {
+            let elapsed = now.saturating_sub(h.started_at).min(h.duration_seconds);
+            // If still inside the hibernation window, vault cannot expire.
+            if elapsed < h.duration_seconds {
+                return false;
+            }
+            h.duration_seconds
+        } else {
+            0u64
+        };
+        now >= vault.last_check_in + vault.check_in_interval + hibernated
     }
 
     /// Retrieves a vault by its unique identifier.
@@ -2595,6 +2612,9 @@ impl TtlVaultContract {
         Self::save_vault(&env, vault_id, &vault);
         Self::remove_owner_vault_id(&env, &vault.owner, vault_id, vault.check_in_interval);
         Self::remove_beneficiary_vault_id(&env, &vault.beneficiary, vault_id, vault.check_in_interval);
+        // Remove fingerprint so the same parameters can be reused
+        let fp = Self::vault_fingerprint(&env, &vault.owner, &vault.beneficiary, vault.check_in_interval);
+        env.storage().persistent().remove(&DataKey::VaultFingerprint(fp));
         Self::record_state_transition(&env, vault_id, ReleaseStatus::Locked, ReleaseStatus::Cancelled, &caller);
         Self::log_audit_entry(&env, vault_id, "cancel_vault", &caller, "");
         Self::append_activity_log(&env, vault_id, "cancel_vault", &caller, "");
@@ -3598,6 +3618,18 @@ impl TtlVaultContract {
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
         env.storage().persistent().set(&key, vault);
         env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+    }
+
+    /// Compute a 32-byte fingerprint for (owner, beneficiary, check_in_interval).
+    /// Used to detect duplicate vault creation attempts.
+    fn vault_fingerprint(env: &Env, owner: &Address, beneficiary: &Address, check_in_interval: u64) -> BytesN<32> {
+        let mut buf = Bytes::new(env);
+        buf.append(&owner.clone().to_xdr(env));
+        buf.append(&beneficiary.clone().to_xdr(env));
+        for b in check_in_interval.to_be_bytes().iter() {
+            buf.push_back(*b);
+        }
+        env.crypto().sha256(&buf)
     }
 
     fn load_beneficiary_vault_ids(env: &Env, beneficiary: &Address) -> Vec<u64> {
@@ -5855,26 +5887,35 @@ impl TtlVaultContract {
             .get(&DataKey::ReleaseVoteThreshold(vault_id))
     }
 
-    // ── Issue #494: Beneficiary Succession Planning ───────────────────────────
+    // ── Hibernation ──────────────────────────────────────────────────────────
 
-    /// Sets a successor beneficiary for a vault.
+    /// Puts a vault into hibernation for `duration_seconds`.
     ///
-    /// If the primary beneficiary declines or is unavailable, the owner can
-    /// activate the succession plan to redirect funds to the successor.
+    /// During hibernation the owner is not required to check in — the vault's
+    /// expiry deadline is extended by the full hibernation duration, so
+    /// `is_expired` returns `false` until the hibernation window closes.
+    /// Normal operations (deposit, withdraw, check_in) remain available.
     ///
     /// # Arguments
-    /// * `vault_id`          - The vault ID
-    /// * `caller`            - Must be the vault owner (requires auth)
-    /// * `successor`         - Fallback beneficiary address
-    /// * `activation_delay`  - Seconds after activation before successor can claim (0 = immediate)
-    pub fn set_succession_plan(
+    /// * `vault_id`         - The vault to hibernate
+    /// * `caller`           - Must be the vault owner
+    /// * `duration_seconds` - How long (in seconds) the hibernation lasts (> 0)
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`          - Caller is not the vault owner
+    /// * `ContractError::AlreadyReleased`   - Vault is not Locked
+    /// * `ContractError::AlreadyHibernating`- Vault is already hibernating
+    /// * `ContractError::InvalidInterval`   - `duration_seconds` is zero
+    pub fn enter_hibernation(
         env: Env,
         vault_id: u64,
         caller: Address,
-        successor: Address,
-        activation_delay: u64,
+        duration_seconds: u64,
     ) -> Result<(), ContractError> {
         caller.require_auth();
+        if duration_seconds == 0 {
+            return Err(ContractError::InvalidInterval);
+        }
         let vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
@@ -5882,33 +5923,37 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
-        if successor == vault.owner || successor == vault.beneficiary {
-            return Err(ContractError::InvalidBeneficiary);
+        let hib_key = DataKey::Hibernation(vault_id);
+        if env.storage().persistent().has(&hib_key) {
+            return Err(ContractError::AlreadyHibernating);
         }
-        let plan = SuccessionPlan {
-            successor: successor.clone(),
-            activation_delay,
-            activated: false,
-            activated_at: 0,
-        };
-        let key = DataKey::SuccessionPlan(vault_id);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().set(&key, &plan);
-        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        let now = env.ledger().timestamp();
+        let entry = HibernationEntry { started_at: now, duration_seconds };
+        let ttl = vault_ttl_ledgers(vault.check_in_interval + duration_seconds);
+        env.storage().persistent().set(&hib_key, &entry);
+        env.storage().persistent().extend_ttl(&hib_key, VAULT_TTL_THRESHOLD, ttl);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((SUCCESSION_SET_TOPIC, vault_id), (caller, successor, activation_delay));
+        env.events().publish(
+            (HIBERNATION_ENTERED_TOPIC, vault_id),
+            (caller, now, duration_seconds),
+        );
         Ok(())
     }
 
-    /// Activates the succession plan, redirecting the vault beneficiary to the successor.
+    /// Exits hibernation early, resuming normal check-in requirements.
     ///
-    /// Can only be called by the vault owner. Requires a succession plan to be set
-    /// and not yet activated.
+    /// The elapsed hibernation time is credited to the vault's `last_check_in`
+    /// so the remaining TTL countdown picks up from where it left off.
     ///
     /// # Arguments
-    /// * `vault_id` - The vault ID
-    /// * `caller`   - Must be the vault owner (requires auth)
-    pub fn activate_succession(
+    /// * `vault_id` - The vault to wake from hibernation
+    /// * `caller`   - Must be the vault owner
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`        - Caller is not the vault owner
+    /// * `ContractError::AlreadyReleased` - Vault is not Locked
+    /// * `ContractError::NotHibernating`  - Vault is not currently hibernating
+    pub fn exit_hibernation(
         env: Env,
         vault_id: u64,
         caller: Address,
@@ -5921,377 +5966,28 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
-        let key = DataKey::SuccessionPlan(vault_id);
-        let mut plan: SuccessionPlan = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(ContractError::SuccessionNotSet)?;
-        if plan.activated {
-            return Err(ContractError::SuccessionAlreadyActivated);
-        }
+        let hib_key = DataKey::Hibernation(vault_id);
+        let entry = env.storage().persistent()
+            .get::<DataKey, HibernationEntry>(&hib_key)
+            .ok_or(ContractError::NotHibernating)?;
         let now = env.ledger().timestamp();
-        plan.activated = true;
-        plan.activated_at = now;
-        // Update vault beneficiary to successor
-        let old_beneficiary = vault.beneficiary.clone();
-        vault.beneficiary = plan.successor.clone();
+        // Credit elapsed hibernation time so the TTL countdown resumes correctly.
+        let elapsed = now.saturating_sub(entry.started_at).min(entry.duration_seconds);
+        vault.last_check_in = vault.last_check_in.saturating_add(elapsed);
+        env.storage().persistent().remove(&hib_key);
         Self::save_vault(&env, vault_id, &vault);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().set(&key, &plan);
-        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish(
-            (SUCCESSION_ACTIVATED_TOPIC, vault_id),
-            (old_beneficiary, plan.successor.clone(), now),
+            (HIBERNATION_EXITED_TOPIC, vault_id),
+            (caller, now, elapsed),
         );
-        Self::emit_notification(&env, vault_id, String::from_str(&env, "succession_activated"));
         Ok(())
     }
 
-    /// Returns the succession plan for a vault, if set.
-    pub fn get_succession_plan(env: Env, vault_id: u64) -> Option<SuccessionPlan> {
-        env.storage().persistent().get(&DataKey::SuccessionPlan(vault_id))
-    }
-
-    // ── Issue #495: Beneficiary Escrow ────────────────────────────────────────
-
-    /// Creates an escrow entry after vault release, holding funds pending beneficiary acceptance.
-    ///
-    /// Called internally after `trigger_release` or can be called by the owner to
-    /// place released funds into escrow. The beneficiary has until `expiry_seconds`
-    /// to accept; otherwise funds return to the owner.
-    ///
-    /// # Arguments
-    /// * `vault_id`        - The vault ID
-    /// * `caller`          - Must be the vault owner (requires auth)
-    /// * `expiry_seconds`  - Seconds from now until the escrow expires
-    pub fn create_escrow(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-        expiry_seconds: u64,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-        if vault.balance == 0 {
-            return Err(ContractError::EmptyVault);
-        }
-        if expiry_seconds == 0 {
-            return Err(ContractError::InvalidInterval);
-        }
-        let key = DataKey::EscrowEntry(vault_id);
-        if env.storage().persistent().has(&key) {
-            return Err(ContractError::EscrowAlreadySettled);
-        }
-        let now = env.ledger().timestamp();
-        let entry = EscrowEntry {
-            amount: vault.balance,
-            beneficiary: vault.beneficiary.clone(),
-            created_at: now,
-            expires_at: now + expiry_seconds,
-            accepted: false,
-        };
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().set(&key, &entry);
-        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish(
-            (ESCROW_CREATED_TOPIC, vault_id),
-            (vault.beneficiary.clone(), vault.balance, now + expiry_seconds),
-        );
-        Self::emit_notification(&env, vault_id, String::from_str(&env, "escrow_created"));
-        Ok(())
-    }
-
-    /// Beneficiary accepts the escrow, releasing funds to themselves.
-    ///
-    /// # Arguments
-    /// * `vault_id` - The vault ID
-    /// * `caller`   - Must be the escrow beneficiary (requires auth)
-    pub fn accept_escrow(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        let key = DataKey::EscrowEntry(vault_id);
-        let mut entry: EscrowEntry = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(ContractError::EscrowNotFound)?;
-        if entry.accepted {
-            return Err(ContractError::EscrowAlreadySettled);
-        }
-        let now = env.ledger().timestamp();
-        if now > entry.expires_at {
-            return Err(ContractError::EscrowExpired);
-        }
-        if caller != entry.beneficiary {
-            return Err(ContractError::NotBeneficiary);
-        }
-        entry.accepted = true;
-        env.storage().persistent().set(&key, &entry);
-        // Transfer funds to beneficiary
-        let token_client = token::Client::new(&env, &vault.token_address);
-        token_client.transfer(&env.current_contract_address(), &caller, &entry.amount);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((ESCROW_ACCEPTED_TOPIC, vault_id), (caller.clone(), entry.amount));
-        Self::emit_notification(&env, vault_id, String::from_str(&env, "escrow_accepted"));
-        Ok(())
-    }
-
-    /// Beneficiary rejects the escrow, returning funds to the vault owner.
-    ///
-    /// # Arguments
-    /// * `vault_id` - The vault ID
-    /// * `caller`   - Must be the escrow beneficiary (requires auth)
-    pub fn reject_escrow(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        let key = DataKey::EscrowEntry(vault_id);
-        let mut entry: EscrowEntry = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(ContractError::EscrowNotFound)?;
-        if entry.accepted {
-            return Err(ContractError::EscrowAlreadySettled);
-        }
-        let now = env.ledger().timestamp();
-        if now > entry.expires_at {
-            return Err(ContractError::EscrowExpired);
-        }
-        if caller != entry.beneficiary {
-            return Err(ContractError::NotBeneficiary);
-        }
-        entry.accepted = false;
-        // Mark as settled by removing the entry
-        env.storage().persistent().remove(&key);
-        // Return funds to owner
-        let token_client = token::Client::new(&env, &vault.token_address);
-        token_client.transfer(&env.current_contract_address(), &vault.owner, &entry.amount);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((ESCROW_REJECTED_TOPIC, vault_id), (caller, entry.amount));
-        Self::emit_notification(&env, vault_id, String::from_str(&env, "escrow_rejected"));
-        Ok(())
-    }
-
-    /// Expires an escrow whose deadline has passed, returning funds to the vault owner.
-    ///
-    /// Anyone can call this once the escrow has expired.
-    ///
-    /// # Arguments
-    /// * `vault_id` - The vault ID
-    pub fn expire_escrow(env: Env, vault_id: u64) -> Result<(), ContractError> {
-        let vault = Self::load_vault(&env, vault_id);
-        let key = DataKey::EscrowEntry(vault_id);
-        let entry: EscrowEntry = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(ContractError::EscrowNotFound)?;
-        if entry.accepted {
-            return Err(ContractError::EscrowAlreadySettled);
-        }
-        let now = env.ledger().timestamp();
-        if now <= entry.expires_at {
-            return Err(ContractError::NotExpired);
-        }
-        env.storage().persistent().remove(&key);
-        let token_client = token::Client::new(&env, &vault.token_address);
-        token_client.transfer(&env.current_contract_address(), &vault.owner, &entry.amount);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((ESCROW_EXPIRED_TOPIC, vault_id), (vault.owner.clone(), entry.amount));
-        Self::emit_notification(&env, vault_id, String::from_str(&env, "escrow_expired"));
-        Ok(())
-    }
-
-    /// Returns the escrow entry for a vault, if one exists.
-    pub fn get_escrow(env: Env, vault_id: u64) -> Option<EscrowEntry> {
-        env.storage().persistent().get(&DataKey::EscrowEntry(vault_id))
-    }
-
-    // ── Issue #496: Beneficiary Dispute Arbitration ───────────────────────────
-
-    /// Sets an arbitrator for a vault.
-    ///
-    /// The arbitrator is a trusted third party who can rule on disputes between
-    /// the owner and beneficiary. Only the vault owner can set the arbitrator.
-    ///
-    /// # Arguments
-    /// * `vault_id`   - The vault ID
-    /// * `caller`     - Must be the vault owner (requires auth)
-    /// * `arbitrator` - The arbitrator address
-    pub fn set_arbitrator(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-        arbitrator: Address,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-        if arbitrator == vault.owner || arbitrator == vault.beneficiary {
-            return Err(ContractError::InvalidBeneficiary);
-        }
-        let config = ArbitrationConfig {
-            arbitrator: arbitrator.clone(),
-            ruled: false,
-            ruling: false,
-            ruled_at: 0,
-        };
-        let key = DataKey::ArbitrationConfig(vault_id);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().set(&key, &config);
-        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((ARBITRATOR_SET_TOPIC, vault_id), (caller, arbitrator));
-        Ok(())
-    }
-
-    /// The arbitrator issues a ruling on a filed dispute.
-    ///
-    /// * `ruling = true`  → release funds to beneficiary
-    /// * `ruling = false` → return funds to owner
-    ///
-    /// Requires a dispute to be in `Filed` state and an arbitrator to be configured.
-    ///
-    /// # Arguments
-    /// * `vault_id` - The vault ID
-    /// * `caller`   - Must be the configured arbitrator (requires auth)
-    /// * `ruling`   - `true` = favour beneficiary, `false` = favour owner
-    pub fn arbitrate_dispute(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-        ruling: bool,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-
-        let arb_key = DataKey::ArbitrationConfig(vault_id);
-        let mut config: ArbitrationConfig = env
-            .storage()
-            .persistent()
-            .get(&arb_key)
-            .ok_or(ContractError::ArbitratorNotSet)?;
-        if caller != config.arbitrator {
-            return Err(ContractError::NotArbitrator);
-        }
-        if config.ruled {
-            return Err(ContractError::ArbitrationAlreadyRuled);
-        }
-
-        // Dispute must be filed
-        let dispute_status = env
-            .storage()
-            .persistent()
-            .get::<DataKey, DisputeStatus>(&DataKey::DisputeStatus(vault_id))
-            .unwrap_or(DisputeStatus::None);
-        if dispute_status != DisputeStatus::Filed {
-            return Err(ContractError::InvalidBeneficiary);
-        }
-
-        let now = env.ledger().timestamp();
-        config.ruled = true;
-        config.ruling = ruling;
-        config.ruled_at = now;
-
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().set(&arb_key, &config);
-        env.storage().persistent().extend_ttl(&arb_key, VAULT_TTL_THRESHOLD, ttl);
-
-        // Mark dispute as resolved
+    /// Returns the current hibernation entry for a vault, if it is hibernating.
+    pub fn get_hibernation(env: Env, vault_id: u64) -> Option<HibernationEntry> {
         env.storage()
             .persistent()
-            .set(&DataKey::DisputeStatus(vault_id), &DisputeStatus::Resolved);
-
-        // Execute ruling: transfer funds accordingly
-        if vault.balance > 0 {
-            let token_client = token::Client::new(&env, &vault.token_address);
-            let recipient = if ruling { vault.beneficiary.clone() } else { vault.owner.clone() };
-            token_client.transfer(&env.current_contract_address(), &recipient, &vault.balance);
-        }
-
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish(
-            (ARBITRATION_RULED_TOPIC, vault_id),
-            (caller, ruling, now),
-        );
-        Self::emit_notification(&env, vault_id, String::from_str(&env, "arbitration_ruled"));
-        Ok(())
-    }
-
-    /// Returns the arbitration configuration for a vault, if set.
-    pub fn get_arbitration_config(env: Env, vault_id: u64) -> Option<ArbitrationConfig> {
-        env.storage().persistent().get(&DataKey::ArbitrationConfig(vault_id))
-    }
-
-    // ── Issue #497: Beneficiary Notification System ───────────────────────────
-
-    /// Emits a vault status notification event and appends it to the on-chain log.
-    ///
-    /// Can be called by the vault owner or admin to notify the beneficiary of
-    /// any status change. Automatically called by succession, escrow, and arbitration.
-    ///
-    /// # Arguments
-    /// * `vault_id` - The vault ID
-    /// * `caller`   - Must be the vault owner or admin (requires auth)
-    /// * `kind`     - Short notification type string (max 32 chars)
-    pub fn notify_beneficiary(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-        kind: String,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        let is_admin = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .map(|a| a == caller)
-            .unwrap_or(false);
-        if caller != vault.owner && !is_admin {
-            return Err(ContractError::NotOwner);
-        }
-        Self::emit_notification(&env, vault_id, kind);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        Ok(())
-    }
-
-    /// Returns the notification log for a vault.
-    pub fn get_notification_log(env: Env, vault_id: u64) -> Vec<NotificationEntry> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::NotificationLog(vault_id))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// Internal helper: appends a notification entry and emits the event.
-    fn emit_notification(env: &Env, vault_id: u64, kind: String) {
-        let now = env.ledger().timestamp();
-        let key = DataKey::NotificationLog(vault_id);
-        let mut log: Vec<NotificationEntry> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        log.push_back(NotificationEntry { kind: kind.clone(), timestamp: now });
-        env.storage().persistent().set(&key, &log);
-        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
-        env.events().publish((VAULT_NOTIFY_TOPIC, vault_id), (kind, now));
+            .get(&DataKey::Hibernation(vault_id))
     }
 }
