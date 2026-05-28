@@ -39,6 +39,7 @@ use types::{
     ProofOfLifeEntry, ReleaseVoteEntry,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
     EMERGENCY_FREEZE_TOPIC, FREEZE_RESOLVED_TOPIC,
+    BeneficiaryRotationEntry, BEN_ROTATION_TOPIC,
 };
 
 #[cfg(test)]
@@ -1193,6 +1194,30 @@ impl TtlVaultContract {
                     env.events().publish((ACCEPTANCE_DEADLINE_EXPIRED_TOPIC,), (vault_id, vault.owner.clone(), total));
                     return;
                 }
+            }
+        }
+
+        // Apply scheduled beneficiary rotation if effective timestamp has passed
+        let rot_key = DataKey::BeneficiaryRotationSchedule(vault_id);
+        if let Some(mut schedule) = env.storage().persistent()
+            .get::<DataKey, Vec<BeneficiaryRotationEntry>>(&rot_key)
+        {
+            // Find the latest entry whose effective_timestamp <= now
+            let mut applied: Option<BeneficiaryRotationEntry> = None;
+            for entry in schedule.iter() {
+                if entry.effective_timestamp <= now {
+                    if applied.as_ref().map_or(true, |a: &BeneficiaryRotationEntry| entry.effective_timestamp > a.effective_timestamp) {
+                        applied = Some(entry.clone());
+                    }
+                }
+            }
+            if let Some(rotation) = applied {
+                if rotation.new_beneficiaries.is_empty() {
+                    // single-beneficiary rotation not supported via this path; skip
+                } else {
+                    vault.beneficiaries = rotation.new_beneficiaries.clone();
+                }
+                env.events().publish((BEN_ROTATION_TOPIC, vault_id), rotation.effective_timestamp);
             }
         }
 
@@ -5848,6 +5873,72 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&DataKey::ReleaseVoteThreshold(vault_id))
+    }
+
+    /// Returns the release vote threshold for a vault, if set.
+    pub fn get_release_vote_threshold(env: Env, vault_id: u64) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReleaseVoteThreshold(vault_id))
+    }
+
+    // ── Beneficiary Rotation Schedule ────────────────────────────────────────
+
+    /// Schedules a future beneficiary rotation for a vault.
+    ///
+    /// At `trigger_release` time, if `effective_timestamp` has passed, the vault's
+    /// beneficiaries are replaced with the provided list before funds are distributed.
+    /// Multiple entries can be scheduled; the one with the latest effective timestamp
+    /// that has already passed is applied.
+    ///
+    /// # Arguments
+    /// * `vault_id`            - The vault to configure
+    /// * `caller`              - Must be the vault owner (requires auth)
+    /// * `effective_timestamp` - Unix timestamp when this rotation becomes active
+    /// * `new_beneficiaries`   - Replacement beneficiary list (must sum to 10 000 bps)
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`    - If caller is not the vault owner
+    /// * `ContractError::InvalidBps`  - If bps do not sum to 10 000
+    pub fn schedule_beneficiary_rotation(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        effective_timestamp: u64,
+        new_beneficiaries: Vec<BeneficiaryEntry>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        // Validate bps sum to 10_000
+        let total_bps: u32 = new_beneficiaries.iter().map(|e| e.bps).sum();
+        if total_bps != 10_000 {
+            return Err(ContractError::InvalidBps);
+        }
+        let rot_key = DataKey::BeneficiaryRotationSchedule(vault_id);
+        let mut schedule: Vec<BeneficiaryRotationEntry> = env.storage().persistent()
+            .get(&rot_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        schedule.push_back(BeneficiaryRotationEntry {
+            effective_timestamp,
+            new_beneficiaries,
+        });
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&rot_key, &schedule);
+        env.storage().persistent().extend_ttl(&rot_key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((BEN_ROTATION_TOPIC, vault_id), effective_timestamp);
+        Ok(())
+    }
+
+    /// Returns all scheduled beneficiary rotations for a vault.
+    pub fn get_beneficiary_rotation_schedule(env: Env, vault_id: u64) -> Vec<BeneficiaryRotationEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BeneficiaryRotationSchedule(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // ── Emergency Freeze ─────────────────────────────────────────────────────

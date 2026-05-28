@@ -101,6 +101,13 @@ pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
 // Issue: Accelerated TTL Decay
 pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
 
+// Emergency freeze events
+pub const EMERGENCY_FREEZE_TOPIC: Symbol = symbol_short!("emg_frz");
+pub const FREEZE_RESOLVED_TOPIC: Symbol = symbol_short!("frz_res");
+
+// Beneficiary rotation
+pub const BEN_ROTATION_TOPIC: Symbol = symbol_short!("ben_rot");
+
 // Issue: Geographic Check-in Tracking
 pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
 
@@ -180,6 +187,8 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
+    // Beneficiary rotation schedule
+    BeneficiaryRotationSchedule(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -223,6 +232,7 @@ pub enum ReleaseStatus {
     Locked,
     Released,
     Cancelled,
+    EmergencyFrozen,
 }
 
 #[contracttype]
@@ -536,4 +546,14 @@ pub struct TtlPool {
 pub struct BiometricEntry {
     pub credential_hash: BytesN<32>,
     pub added_at: u64,
+}
+
+/// A scheduled beneficiary rotation entry.
+/// When `effective_timestamp` is reached at release time, the vault's
+/// beneficiaries are replaced with `new_beneficiaries`.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryRotationEntry {
+    pub effective_timestamp: u64,
+    pub new_beneficiaries: Vec<BeneficiaryEntry>,
 }
