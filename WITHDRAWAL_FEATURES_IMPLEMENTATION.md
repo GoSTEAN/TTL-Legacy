@@ -1,291 +1,314 @@
 # Withdrawal Features Implementation Summary
 
+This document summarizes the implementation of four withdrawal-related features for TTL-Legacy (Issues #569, #570, #571, #572).
+
 ## Overview
-This document summarizes the implementation of four withdrawal-related features for the TTL-Legacy smart contract, addressing GitHub issues #573, #574, #575, and #576.
 
-## Branch Information
-- **Branch Name**: `feature/573-574-575-576-withdrawal-features`
-- **Commit Hash**: `a4eea9a`
-- **Files Modified**: 
-  - `contracts/ttl_vault/src/types.rs`
-  - `contracts/ttl_vault/src/lib.rs`
+Four interconnected withdrawal features have been implemented to enhance security, efficiency, and user experience:
 
-## Features Implemented
+1. **Issue #569**: Withdrawal Audit Trail - Track all withdrawal attempts
+2. **Issue #570**: Withdrawal Batching - Batch multiple withdrawals efficiently
+3. **Issue #571**: Withdrawal Notifications - Real-time alerts to owners
+4. **Issue #572**: Withdrawal Dispute - Challenge unauthorized withdrawals
 
-### Issue #573: Withdrawal Proof
-**Purpose**: Generate cryptographic proof of withdrawal for compliance
+## Implementation Details
 
-#### New Types
-- `WithdrawalProof` struct containing:
-  - `vault_id: u64` - Vault identifier
-  - `amount: i128` - Withdrawal amount
-  - `timestamp: u64` - Proof timestamp
-  - `proof_hash: BytesN<32>` - Cryptographic hash
-  - `nonce: u64` - Unique nonce for proof
+### 1. Withdrawal Audit Trail (Issue #569)
 
-#### New Functions
-- `generate_withdrawal_proof(env, vault_id, amount) -> Result<WithdrawalProof, ContractError>`
-  - Validates vault exists and has sufficient balance
-  - Creates cryptographic proof hash
-  - Stores proof in persistent storage
-  - Emits `WITHDRAWAL_PROOF_TOPIC` event
+**Purpose**: Track all withdrawal attempts (successful and failed) with comprehensive details for security and compliance.
 
-#### Storage Keys
-- `DataKey::WithdrawalProof(u64, u64)` - Stores proof by vault_id and nonce
+**Changes Made**:
 
-#### Events
-- `WITHDRAWAL_PROOF_TOPIC` - Emitted when proof is generated
+#### Types Added
+- `WithdrawalAuditEntry`: Struct to store withdrawal audit information
+  - `vault_id`: The vault ID
+  - `caller`: The address attempting withdrawal
+  - `amount`: The withdrawal amount in stroops
+  - `timestamp`: The ledger timestamp
+  - `success`: Whether the withdrawal succeeded
+  - `error_reason`: Reason for failure (if applicable)
 
----
+#### DataKey Variants
+- `WithdrawalAuditLog(u64)`: Storage key for audit log entries
 
-### Issue #576: Withdrawal Escrow
-**Purpose**: Hold withdrawn funds in escrow pending verification
+#### Event Topics
+- `WITHDRAWAL_AUDIT_TOPIC`: Emitted for all withdrawal attempts
+- `WITHDRAWAL_FAILED_TOPIC`: Emitted only for failed attempts
 
-#### New Types
-- `WithdrawalEscrow` struct containing:
-  - `vault_id: u64` - Vault identifier
-  - `amount: i128` - Escrowed amount
-  - `timestamp: u64` - Escrow creation time
-  - `beneficiary: Address` - Beneficiary address
-  - `verified: bool` - Verification status
+#### Functions Added
+- `record_withdrawal_audit()`: Internal function to record withdrawal attempts
+- `get_withdrawal_audit_log()`: Public function to retrieve audit trail
 
-#### New Functions
-- `create_withdrawal_escrow(env, vault_id, amount, beneficiary) -> Result<(), ContractError>`
-  - Validates vault exists and has sufficient balance
-  - Creates escrow entry with unverified status
-  - Stores in persistent storage
-  - Emits `WITHDRAWAL_ESCROW_CREATED_TOPIC` event
+#### Integration Points
+- Enhanced `withdraw()` function to record all attempts (success/failure)
+- Enhanced `batch_withdraw()` function to record each withdrawal in batch
 
-- `verify_withdrawal_escrow(env, vault_id) -> Result<(), ContractError>`
-  - Retrieves escrow entry
-  - Transfers funds to beneficiary
-  - Removes escrow from storage
-  - Emits `WITHDRAWAL_ESCROW_VERIFIED_TOPIC` event
+**Benefits**:
+- Complete audit trail for compliance
+- Failure tracking for debugging
+- On-chain permanent record
+- Event-based notifications
 
-#### Storage Keys
-- `DataKey::WithdrawalEscrow(u64)` - Stores escrow by vault_id
+### 2. Withdrawal Batching (Issue #570)
 
-#### Events
-- `WITHDRAWAL_ESCROW_CREATED_TOPIC` - Emitted when escrow is created
-- `WITHDRAWAL_ESCROW_VERIFIED_TOPIC` - Emitted when escrow is verified and released
+**Purpose**: Batch multiple small withdrawals into single transaction for efficiency.
 
----
+**Changes Made**:
 
-### Issue #574: Withdrawal Rollback
-**Purpose**: Allow rolling back withdrawals if fraud is detected
+#### Enhanced Functions
+- `batch_withdraw()`: Already existed, now enhanced with:
+  - Audit trail recording for each withdrawal
+  - Notification events for each withdrawal
+  - Improved error handling with audit logging
 
-#### New Types
-- `WithdrawalRollback` struct containing:
-  - `vault_id: u64` - Vault identifier
-  - `original_amount: i128` - Original withdrawal amount
-  - `rollback_amount: i128` - Amount being rolled back
-  - `timestamp: u64` - Rollback timestamp
-  - `reason: String` - Reason for rollback
+#### Integration
+- Each withdrawal in batch is individually recorded in audit trail
+- Each withdrawal generates a notification event
+- Atomic validation before any state changes
 
-#### New Functions
-- `rollback_withdrawal(env, vault_id, rollback_amount, reason, caller) -> Result<(), ContractError>`
-  - Requires caller authentication
-  - Validates caller is vault owner
-  - Validates rollback amount is positive
-  - Restores funds to vault balance
-  - Stores rollback record in persistent storage
-  - Emits `WITHDRAWAL_ROLLBACK_TOPIC` event
+**Benefits**:
+- Reduced gas costs (single transaction overhead)
+- Atomic execution (all-or-nothing)
+- Individual tracking of each withdrawal
+- Improved efficiency for multi-vault operations
 
-#### Storage Keys
-- `DataKey::WithdrawalRollback(u64)` - Stores rollback by vault_id
+### 3. Withdrawal Notifications (Issue #571)
 
-#### Events
-- `WITHDRAWAL_ROLLBACK_TOPIC` - Emitted when withdrawal is rolled back
+**Purpose**: Notify owner of all withdrawal attempts in real-time.
 
----
+**Changes Made**:
 
-### Issue #575: Withdrawal Rate Limiting
-**Purpose**: Limit withdrawal frequency to prevent abuse
+#### Event Topics
+- `WITHDRAWAL_NOTIF_TOPIC`: Emitted for every successful withdrawal
+  - Includes: vault_id, caller, amount, timestamp
 
-#### New Types
-- `WithdrawalRateLimit` struct containing:
-  - `vault_id: u64` - Vault identifier
-  - `last_withdrawal_time: u64` - Timestamp of last withdrawal
-  - `withdrawal_count: u32` - Count of withdrawals
-  - `cooldown_seconds: u64` - Minimum seconds between withdrawals
+#### Integration Points
+- Enhanced `withdraw()` function to emit notification
+- Enhanced `batch_withdraw()` function to emit notification for each withdrawal
 
-#### New Functions
-- `set_withdrawal_rate_limit(env, vault_id, cooldown_seconds, caller) -> Result<(), ContractError>`
-  - Requires caller authentication
-  - Validates caller is vault owner
-  - Creates rate limit entry with specified cooldown
-  - Stores in persistent storage
-  - Returns `Ok(())` on success
+#### Off-Chain Integration
+- Backend services can listen to events
+- Real-time alerts via email/SMS
+- Dashboard updates
 
-- `is_withdrawal_allowed(env, vault_id) -> Result<bool, ContractError>`
-  - Checks if rate limit exists for vault
-  - Calculates time since last withdrawal
-  - Returns `true` if cooldown has elapsed
-  - Returns `false` if still in cooldown period
-  - Emits `WITHDRAWAL_RATE_LIMITED_TOPIC` event if rate limited
+**Benefits**:
+- Real-time security alerts
+- Off-chain integration capability
+- Comprehensive withdrawal tracking
+- User awareness of vault activity
 
-#### Storage Keys
-- `DataKey::WithdrawalRateLimit(u64)` - Stores rate limit by vault_id
+### 4. Withdrawal Dispute (Issue #572)
 
-#### Events
-- `WITHDRAWAL_RATE_LIMITED_TOPIC` - Emitted when withdrawal is rate limited
+**Purpose**: Allow disputing unauthorized withdrawals within grace period.
 
----
+**Changes Made**:
 
-## Data Storage
+#### Types Added
+- `WithdrawalDispute`: Struct to store dispute information
+  - `vault_id`: The vault ID
+  - `withdrawal_timestamp`: When the withdrawal occurred
+  - `dispute_filed_at`: When the dispute was filed
+  - `dispute_expires_at`: When the dispute grace period expires
+  - `status`: Current dispute status (None, Filed, Resolved)
+  - `reason`: Reason for the dispute
+  - `resolved_at`: When the dispute was resolved (if applicable)
 
-### New DataKey Variants
+#### DataKey Variants
+- `WithdrawalDisputes(u64)`: Storage key for dispute entries
+
+#### Event Topics
+- `WITHDRAWAL_DISPUTE_FILED_TOPIC`: Emitted when dispute is filed
+- `WITHDRAWAL_DISPUTE_RESOLVED_TOPIC`: Emitted when dispute is resolved
+
+#### Functions Added
+- `file_withdrawal_dispute()`: File a dispute for a withdrawal
+- `resolve_withdrawal_dispute()`: Resolve a filed dispute
+- `get_withdrawal_disputes()`: Retrieve all disputes for a vault
+
+#### Grace Period
+- Duration: 24 hours (86,400 seconds)
+- Disputes must be filed within this window
+- Automatically expires after grace period
+
+**Benefits**:
+- Security mechanism for unauthorized withdrawals
+- Owner-controlled dispute resolution
+- Time-limited grace period
+- Complete dispute history
+
+## Code Changes
+
+### Files Modified
+
+1. **contracts/ttl_vault/src/types.rs**
+   - Added event topics for withdrawal features
+   - Added `WithdrawalAuditEntry` struct
+   - Added `WithdrawalDispute` struct
+   - Added `DataKey` variants
+
+2. **contracts/ttl_vault/src/lib.rs**
+   - Updated imports to include new types
+   - Enhanced `withdraw()` function
+   - Enhanced `batch_withdraw()` function
+   - Added helper functions for audit trail and disputes
+
+3. **contracts/ttl_vault/src/test.rs**
+   - Added comprehensive tests for all features
+   - 12 new test functions covering all scenarios
+
+4. **docs/withdrawal-features.md** (New)
+   - Complete documentation for all features
+   - API reference with examples
+   - Integration guides
+   - Security considerations
+
+5. **README.md**
+   - Updated feature list
+   - Added reference to withdrawal features documentation
+
+## Testing
+
+### Test Coverage
+
+#### Withdrawal Audit Trail Tests
+- `test_withdrawal_audit_trail_records_successful_withdrawal`: Verify successful withdrawal recording
+- `test_withdrawal_audit_trail_records_failed_withdrawal`: Verify failed withdrawal recording
+- `test_withdrawal_audit_trail_multiple_attempts`: Verify multiple attempts tracking
+
+#### Withdrawal Batching Tests
+- `test_batch_withdraw_with_audit_trail`: Verify batch withdrawals are audited
+- `test_batch_withdraw_efficiency`: Verify multiple vaults in single batch
+
+#### Withdrawal Notification Tests
+- `test_withdrawal_notification_event_emitted`: Verify notification events
+- `test_batch_withdrawal_notifications`: Verify batch notifications
+
+#### Withdrawal Dispute Tests
+- `test_file_withdrawal_dispute`: Verify dispute filing
+- `test_resolve_withdrawal_dispute`: Verify dispute resolution
+- `test_dispute_grace_period`: Verify 24-hour grace period
+- `test_multiple_disputes`: Verify multiple disputes per vault
+- `test_dispute_only_by_owner`: Verify owner-only access
+
+### Test Statistics
+- Total new tests: 12
+- Coverage: All major code paths
+- Edge cases: Included
+
+## API Reference
+
+### Withdrawal Audit Trail
 ```rust
-WithdrawalProof(u64, u64),      // Issue #573
-WithdrawalEscrow(u64),           // Issue #576
-WithdrawalRollback(u64),         // Issue #574
-WithdrawalRateLimit(u64),        // Issue #575
+pub fn get_withdrawal_audit_log(env: Env, vault_id: u64) -> Vec<WithdrawalAuditEntry>
 ```
 
-### Storage TTL Management
-All new storage entries use:
-- **TTL Threshold**: `VAULT_TTL_THRESHOLD` (1000 ledgers)
-- **TTL Duration**: `vault_ttl_ledgers(vault.check_in_interval)` (2× safety buffer)
+### Withdrawal Batching
+```rust
+pub fn batch_withdraw(
+    env: Env,
+    vault_ids: Vec<u64>,
+    amounts: Vec<i128>,
+    caller: Address,
+) -> Result<(), ContractError>
+```
 
----
+### Withdrawal Dispute
+```rust
+pub fn file_withdrawal_dispute(
+    env: Env,
+    vault_id: u64,
+    caller: Address,
+    reason: String,
+) -> Result<(), ContractError>
+
+pub fn resolve_withdrawal_dispute(
+    env: Env,
+    vault_id: u64,
+    caller: Address,
+    dispute_index: u32,
+    approved: bool,
+) -> Result<(), ContractError>
+
+pub fn get_withdrawal_disputes(env: Env, vault_id: u64) -> Vec<WithdrawalDispute>
+```
 
 ## Event Topics
 
-### New Event Topics
+| Topic | Purpose | Data |
+|-------|---------|------|
+| `WITHDRAWAL_AUDIT_TOPIC` | All withdrawal attempts | vault_id, caller, amount, success, timestamp |
+| `WITHDRAWAL_FAILED_TOPIC` | Failed withdrawals | vault_id, caller, amount, error_reason |
+| `WITHDRAWAL_NOTIF_TOPIC` | Successful withdrawals | vault_id, caller, amount, timestamp |
+| `WITHDRAWAL_DISPUTE_FILED_TOPIC` | Dispute filed | vault_id, caller, timestamp, reason |
+| `WITHDRAWAL_DISPUTE_RESOLVED_TOPIC` | Dispute resolved | vault_id, caller, dispute_index, approved |
+
+## Security Considerations
+
+1. **Audit Trail Immutability**: Entries cannot be modified or deleted
+2. **Event Logging**: All events are permanently recorded on-chain
+3. **Grace Period**: 24-hour window provides investigation time
+4. **Owner-Only Disputes**: Only vault owners can file disputes
+5. **Batch Atomicity**: All-or-nothing semantics for batch operations
+
+## Integration Guide
+
+### Backend Integration
 ```rust
-WITHDRAWAL_PROOF_TOPIC: "wd_prf"
-WITHDRAWAL_ROLLBACK_TOPIC: "wd_rbk"
-WITHDRAWAL_RATE_LIMITED_TOPIC: "wd_rl"
-WITHDRAWAL_ESCROW_CREATED_TOPIC: "wd_esc"
-WITHDRAWAL_ESCROW_VERIFIED_TOPIC: "wd_ver"
+// Get audit trail
+let audit_log = client.get_withdrawal_audit_log(&vault_id);
+
+// Check for disputes
+let disputes = client.get_withdrawal_disputes(&vault_id);
+for dispute in disputes.iter() {
+    if dispute.status == DisputeStatus::Filed {
+        // Handle pending dispute
+    }
+}
 ```
 
----
-
-## Error Handling
-
-All functions include comprehensive error handling:
-- `ContractError::InvalidAmount` - For invalid amounts or rate limits
-- `ContractError::VaultNotFound` - When vault doesn't exist
-- `ContractError::InsufficientBalance` - When vault balance is insufficient
-- `ContractError::NotOwner` - When caller is not vault owner
-
----
-
-## Integration Points
-
-### Existing Functions Enhanced
-The new features integrate with existing vault operations:
-- Withdrawal proof can be generated for any withdrawal
-- Escrow can hold funds from any withdrawal
-- Rollback can reverse any withdrawal
-- Rate limiting can be applied to any vault
-
-### Compatibility
-- All features are backward compatible
-- No changes to existing vault structure
-- No changes to existing withdrawal logic
-- Features are optional and can be used independently
-
----
-
-## Testing Recommendations
-
-### Unit Tests
-1. **Withdrawal Proof**
-   - Generate proof for valid withdrawal
-   - Verify proof hash is unique per nonce
-   - Test proof retrieval
-
-2. **Withdrawal Escrow**
-   - Create escrow with valid amount
-   - Verify escrow blocks withdrawal
-   - Release escrow and verify funds transfer
-   - Test escrow expiration
-
-3. **Withdrawal Rollback**
-   - Rollback valid withdrawal
-   - Verify funds are restored
-   - Test rollback history tracking
-   - Verify only owner can rollback
-
-4. **Withdrawal Rate Limiting**
-   - Set rate limit on vault
-   - Verify withdrawal is blocked during cooldown
-   - Verify withdrawal is allowed after cooldown
-   - Test multiple withdrawals
-
-### Integration Tests
-- Test all features working together
-- Test with multi-beneficiary vaults
-- Test with vesting schedules
-- Test with hibernation mode
-
----
-
-## Documentation
-
-### API Reference
-All functions include:
-- Comprehensive doc comments
-- Argument descriptions
-- Return value documentation
-- Error conditions listed
-- Usage examples
-
-### Event Documentation
-All events are documented with:
-- Event topic name
-- Event data structure
-- When event is emitted
-- Event significance
-
----
-
-## Future Enhancements
-
-### Potential Improvements
-1. **Withdrawal Proof Verification**
-   - Add function to verify proof authenticity
-   - Support proof expiration
-
-2. **Escrow Enhancements**
-   - Add escrow timeout mechanism
-   - Support multiple concurrent escrows
-
-3. **Rollback Enhancements**
-   - Add rollback approval workflow
-   - Support partial rollbacks
-
-4. **Rate Limiting Enhancements**
-   - Add tiered rate limits
-   - Support dynamic cooldown adjustment
-
----
+### Frontend Integration
+```javascript
+// Listen for notifications
+sorobanClient.events()
+    .forContract(contractAddress)
+    .onEvent('wd_notif', (event) => {
+        // Handle withdrawal notification
+    });
+```
 
 ## Deployment Notes
 
-### Pre-Deployment Checklist
-- [ ] All tests pass
-- [ ] Code review completed
-- [ ] Documentation updated
-- [ ] Event topics registered
-- [ ] Storage keys documented
+1. **No Breaking Changes**: All changes are backward compatible
+2. **Storage**: New storage keys are isolated to withdrawal features
+3. **Events**: New event topics don't conflict with existing ones
+4. **Gas**: Audit trail recording adds minimal gas overhead
 
-### Post-Deployment Monitoring
-- Monitor event emission rates
-- Track escrow creation/verification
-- Monitor rollback frequency
-- Track rate limit violations
+## Future Enhancements
 
----
+1. **Dispute Arbitration**: Multi-party dispute resolution
+2. **Withdrawal Limits**: Time-based withdrawal limits
+3. **Approval Workflows**: Multi-sig approval for large withdrawals
+4. **Automated Responses**: Automatic dispute resolution based on rules
+
+## Commits
+
+All changes are in a single branch: `feat/569-570-571-572-withdrawal-features`
+
+Commits:
+1. Core implementation (types, functions, events)
+2. Comprehensive tests
+3. Documentation
+4. README updates
 
 ## Conclusion
 
-This implementation provides four complementary withdrawal features that enhance security, compliance, and abuse prevention for the TTL-Legacy vault system. All features are designed to be:
-- **Secure**: Cryptographic proofs and owner-only operations
-- **Compliant**: Audit trails and proof generation
-- **Flexible**: Optional features that work independently
-- **Efficient**: Minimal storage overhead and gas usage
+The withdrawal features implementation provides:
+- ✅ Complete audit trail for compliance
+- ✅ Efficient batching for cost reduction
+- ✅ Real-time notifications for security
+- ✅ Dispute mechanism for fraud prevention
+- ✅ Comprehensive testing and documentation
+- ✅ Backward compatibility
+- ✅ Production-ready code
 
-The features are ready for integration testing and deployment.
+All four issues (#569, #570, #571, #572) are fully implemented and ready for production deployment.
