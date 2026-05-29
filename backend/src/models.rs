@@ -3,6 +3,45 @@ use chrono::{DateTime, Utc};
 
 // ── Notification models ──────────────────────────────────────────────────────
 
+// ── Legacy reminder API models (axum + Db contract) ───────────────────────
+
+/// Reminder notification channel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    Email,
+    Sms,
+    Push,
+}
+
+/// Reminder frequency.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Frequency {
+    Once,
+    Daily,
+    Hourly,
+}
+
+/// Persisted reminder preferences stored by `Db`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderPreferences {
+    pub vault_id: u64,
+    pub channels: Vec<Channel>,
+    pub hours_before_expiry: u32,
+    pub frequency: Frequency,
+}
+
+/// Request body for setting reminder preferences.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SetPreferencesRequest {
+    pub channels: Vec<Channel>,
+    pub hours_before_expiry: u32,
+    pub frequency: Frequency,
+}
+
+
+
 /// Notification type sent to a device.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -355,7 +394,7 @@ pub struct ReminderPreferences {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetPreferencesRequest {
+pub struct VaultSetPreferencesRequest {
     pub channels: Vec<Channel>,
     pub hours_before_expiry: u32,
     pub frequency: Frequency,
@@ -378,6 +417,7 @@ pub enum Frequency {
     Hourly,
     Monthly,
 }
+
 
 
 #[derive(Debug, Serialize, Deserialize)]

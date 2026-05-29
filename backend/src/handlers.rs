@@ -433,7 +433,7 @@ pub fn set_notification_preferences_handler(
     notif_store: &NotificationStore,
     vault_id: &str,
     request: NotificationPreferencesRequest,
-) -> Result<NotificationPreferences, String> {
+) -> Result<VaultNotificationPreferences, String> {
     if request.channels.is_empty() {
         return Err("At least one notification channel is required".to_string());
     }
@@ -471,7 +471,7 @@ pub fn set_notification_preferences_handler(
 pub fn get_notification_preferences_handler(
     notif_store: &NotificationStore,
     vault_id: &str,
-) -> Option<NotificationPreferences> {
+) -> Option<VaultNotificationPreferences> {
     get_notification_preferences(notif_store, vault_id)
 }
 
