@@ -211,6 +211,10 @@ pub enum ContractError {
     // Issue #546: vesting bonus
     BonusNotEnabled = 73,
     TokenNotWhitelisted = 74,
+    // Issue #526: post-release clawback
+    NotReleased = 75,
+    GracePeriodExpired = 76,
+    NothingToClawback = 77,
 }
 
 #[contract]
