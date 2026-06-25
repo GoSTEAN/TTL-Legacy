@@ -34,7 +34,7 @@ use types::{
     CONDITIONS_ACCEPTED_TOPIC, SET_SPENDING_LIMIT_TOPIC, SET_MAX_TTL_TOPIC, SET_DECAY_RATE_TOPIC,
     ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, TTL_DECAY_TOPIC, SYNC_TTL_TOPIC, PASSKEY_EXPIRY_EXTENDED_TOPIC,
     BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC, BENEFICIARY_CONDITION_ACCEPTED_TOPIC,
-    BENEFICIARY_IDENTITY_ORACLE_SET_TOPIC, BENEFICIARY_IDENTITY_VERIFIED_TOPIC,
+    BENEFICIARY_IDENTITY_ORACLE_SET_TOPIC, BENEFICIARY_IDENTITY_VERIFIED_TOPIC, CONFLICT_EXPIRED_TOPIC,
     SET_RECOVERY_TOPIC, RECOVERY_EXTEND_TOPIC,
     RESTORE_VAULT_TOPIC, PASSKEY_USAGE_TOPIC, VAULT_CLONED_TOPIC, VAULT_CLONED_OVERRIDE_TOPIC, VAULT_MERGED_TOPIC,
     MULTISIG_CONFIG_TOPIC, MULTISIG_PROPOSED_TOPIC, MULTISIG_APPROVED_TOPIC, MULTISIG_REJECTED_TOPIC,
@@ -2441,6 +2441,7 @@ impl TtlVaultContract {
                 if entry.address == vault.owner {
                     return Err(ContractError::InvalidBeneficiary);
                 }
+                Self::assert_not_zero_address(&env, &entry.address);
             }
             vault.beneficiaries = beneficiaries.clone();
             Self::save_vault(&env, vault_id, &vault);
@@ -4324,6 +4325,19 @@ impl TtlVaultContract {
         Self::load_vault(&env, vault_id).created_at
     }
 
+    /// Returns the unconditional release time for a vault.
+    ///
+    /// This is the earliest time the vault will automatically release funds
+    /// if no further check-ins occur. Computed as last_check_in + check_in_interval.
+    /// Returns 0 if vault is already expired or released.
+    pub fn get_unconditional_release_time(env: Env, vault_id: u64) -> u64 {
+        let vault = Self::load_vault(&env, vault_id);
+        if vault.status != ReleaseStatus::Locked {
+            return 0;
+        }
+        vault.last_check_in + vault.check_in_interval
+    }
+
     /// Sets a spending limit on a vault, capping the amount released per `trigger_release` call.
     ///
     /// Owner-only. Pass `None` to remove the limit.
@@ -5098,6 +5112,7 @@ impl TtlVaultContract {
         if vault.owner == new_beneficiary {
             return Err(ContractError::InvalidBeneficiary);
         }
+        Self::assert_not_zero_address(&env, &new_beneficiary);
 
         let now = env.ledger().timestamp();
         // Timelock: 24 hours
@@ -6600,6 +6615,13 @@ impl TtlVaultContract {
         let token_address = token_address.clone();
         if !Self::is_token_whitelisted(env.clone(), token_address) {
             panic_with_error!(env, ContractError::TokenNotWhitelisted);
+        }
+    }
+
+    fn assert_not_zero_address(env: &Env, address: &Address) {
+        let zero = Address::from_contract_id(&env, &BytesN::zero(&env));
+        if address == &zero {
+            panic_with_error!(env, ContractError::InvalidBeneficiary);
         }
     }
 
@@ -8126,6 +8148,16 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidBeneficiary);
         }
 
+        // Check if conflict has expired (30 days without resolution)
+        let now = env.ledger().timestamp();
+        if let Some(first_claim) = conflict.claims.first() {
+            if now > first_claim.filed_at + 2_592_000 {
+                // 30 days in seconds
+                env.events().publish((CONFLICT_EXPIRED_TOPIC,), vault_id);
+                return Err(ContractError::InvalidBeneficiary);
+            }
+        }
+
         conflict.resolution = ConflictResolution::Approved(approved_beneficiary.clone());
         conflict.resolved_at = Some(env.ledger().timestamp());
 
@@ -8371,6 +8403,17 @@ impl TtlVaultContract {
         env.storage().persistent().set(&count_key, &proposal_id);
         env.storage().persistent().extend_ttl(&count_key, VAULT_TTL_THRESHOLD, ttl);
 
+        // Add to open proposals list
+        let open_key = DataKey::OpenProposals(vault_id);
+        let mut open_proposals = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&open_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        open_proposals.push_back(proposal_id);
+        env.storage().persistent().set(&open_key, &open_proposals);
+        env.storage().persistent().extend_ttl(&open_key, VAULT_TTL_THRESHOLD, ttl);
+
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish(
             (MULTISIG_PROPOSED_TOPIC, vault_id),
@@ -8468,6 +8511,19 @@ impl TtlVaultContract {
         }
         proposal.status = ProposalStatus::Rejected;
         env.storage().persistent().set(&prop_key, &proposal);
+
+        // Remove from open proposals list
+        let open_key = DataKey::OpenProposals(vault_id);
+        if let Some(mut open_proposals) = env.storage().persistent().get::<DataKey, Vec<u64>>(&open_key) {
+            let mut new_list = Vec::new(&env);
+            for id in open_proposals.iter() {
+                if id != proposal_id {
+                    new_list.push_back(id);
+                }
+            }
+            env.storage().persistent().set(&open_key, &new_list);
+        }
+
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish((MULTISIG_REJECTED_TOPIC, vault_id), proposal_id);
         Ok(())
@@ -8632,6 +8688,18 @@ impl TtlVaultContract {
             }
         }
 
+        // Remove from open proposals list
+        let open_key = DataKey::OpenProposals(vault_id);
+        if let Some(mut open_proposals) = env.storage().persistent().get::<DataKey, Vec<u64>>(&open_key) {
+            let mut new_list = Vec::new(&env);
+            for id in open_proposals.iter() {
+                if id != proposal_id {
+                    new_list.push_back(id);
+                }
+            }
+            env.storage().persistent().set(&open_key, &new_list);
+        }
+
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish((MULTISIG_EXECUTED_TOPIC, vault_id), proposal_id);
         Ok(())
@@ -8650,6 +8718,14 @@ impl TtlVaultContract {
             .persistent()
             .get(&DataKey::MultiSigProposalCount(vault_id))
             .unwrap_or(0)
+    }
+
+    /// Returns a list of open proposal IDs for a vault.
+    pub fn list_open_proposals(env: Env, vault_id: u64) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<u64>>(&DataKey::OpenProposals(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // ── Multi-sig payload helpers ────────────────────────────────────────────
